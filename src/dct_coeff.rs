@@ -898,12 +898,8 @@ impl DctCoeffStep {
     /// On success the matched bits (codeword + sign bit, or escape
     /// prefix + fixed-length payload, or end-of-block) are consumed.
     pub fn parse(br: &mut BitReader<'_>, position: CoefficientPosition) -> Result<Self> {
-        // Match the longest-first codeword against the prefix.
-        //
-        // The walker tries every distinct width that appears in
-        // Tables B.5c..B.5e plus the escape (6 bits) and EoB
-        // (2 bits, gated on `Next`). Longest-first keeps the
-        // match unambiguous on shorter prefixes of longer codes.
+        // MPEG-1 B.5 and MPEG-2 B-14 have the same ordinary codewords;
+        // escape payloads remain standard-specific below.
         let available = br.bits_remaining() as u32;
         if available == 0 {
             return Err(Error::ShortHeader);
@@ -915,52 +911,15 @@ impl DctCoeffStep {
         // fit in `peek_w`.
         let aligned = peeked << (MAX_CODE_LEN - peek_w);
 
-        // (1) Table entries: cand_w + 1 bits needed (codeword + sign).
-        // Iterate widths longest-first. The codeword widths that
-        // appear in Tables B.5c / B.5d / B.5e are exactly:
-        //   B.5c: 1, 2, 3, 4, 5, 6, 7, 8, 10
-        //   B.5d: 12, 13
-        //   B.5e: 14, 15, 16
-        for &cand_w in &[16u8, 15, 14, 13, 12, 10, 8, 7, 6, 5, 4, 3, 2, 1] {
-            let needed = u32::from(cand_w) + 1;
-            if available < needed {
-                continue;
-            }
-            let candidate = aligned >> (MAX_CODE_LEN - u32::from(cand_w));
-            for table in [TABLE_B5C, TABLE_B5D, TABLE_B5E] {
-                for &entry in table {
-                    if entry.bits != cand_w || u32::from(entry.code) != candidate {
-                        continue;
-                    }
-                    // Reject the `1s` 1-bit FIRST-only entry at NEXT.
-                    if entry.bits == 1 && position == CoefficientPosition::Next {
-                        continue;
-                    }
-                    // Reject the `11s` 2-bit NEXT-only entry at FIRST.
-                    if entry.bits == 2
-                        && entry.code == 0b11
-                        && position == CoefficientPosition::First
-                    {
-                        continue;
-                    }
-                    // Consume the codeword + sign.
-                    br.consume(u32::from(entry.bits))
-                        .map_err(|_| Error::ShortHeader)?;
-                    let sign = br.read_u1().map_err(|_| Error::ShortHeader)?;
-                    let signed_level = if sign == 0 {
-                        i16::from(entry.level)
-                    } else {
-                        -i16::from(entry.level)
-                    };
-                    return Ok(Self {
-                        symbol: DctCoeff::RunLevel {
-                            run: entry.run,
-                            signed_level,
-                            escape: false,
-                        },
-                        bit_position_after: br.bit_position(),
-                    });
-                }
+        if let Some((needed, run, signed_level)) = crate::mpeg2_dct_coeff::lookup_coeff(
+            aligned, false, position == CoefficientPosition::First,
+        ) {
+            if available >= needed {
+                br.consume(needed).map_err(|_| Error::ShortHeader)?;
+                return Ok(Self {
+                    symbol: DctCoeff::RunLevel { run, signed_level, escape: false },
+                    bit_position_after: br.bit_position(),
+                });
             }
         }
 

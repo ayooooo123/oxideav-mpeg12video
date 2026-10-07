@@ -68,19 +68,6 @@ fn registry_installs_both_codec_ids() {
     }
 }
 
-#[test]
-fn decoder_needs_flush_before_committing_frames() {
-    // Before flush the §6.1.1.11 reorder cannot commit — the trailing
-    // anchors are unknown, so the decoder asks for more input.
-    let params = CodecParameters::video(CodecId::new(MPEG2_CODEC_ID_STR));
-    let mut dec = make_decoder(&params).expect("make_decoder");
-    dec.send_packet(&Packet::new(0, tb(), FIXTURE.to_vec()))
-        .expect("send_packet");
-    assert!(matches!(dec.receive_frame(), Err(Error::NeedMore)));
-    dec.flush().expect("flush");
-    assert!(dec.receive_frame().is_ok(), "frame available after flush");
-    assert!(matches!(dec.receive_frame(), Err(Error::Eof)), "then Eof");
-}
 
 #[test]
 fn decoder_sample_exact_on_real_fixture() {

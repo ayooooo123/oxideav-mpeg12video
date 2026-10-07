@@ -1512,6 +1512,79 @@ const TABLE_B15_PAGE4: &[CoeffEntry] = &[
     },
 ];
 
+/// Eight-bit primary lookup; only prefixes 0..=3 require a second
+/// eight-bit lookup. Built at compile time from the normative codebook.
+/// FIRST's `1s` is handled before the NEXT table, so no ambiguous rows
+/// or speculative bit consumption enter either table.
+struct PrefixTable {
+    short: [CoeffEntry; 256],
+    long: [CoeffEntry; 1024],
+}
+
+impl PrefixTable {
+    const fn new(pages: [&[CoeffEntry]; 4]) -> Self {
+        let empty = CoeffEntry { code: 0, bits: 0, run: 0, level: 0 };
+        let mut table = Self { short: [empty; 256], long: [empty; 1024] };
+        let mut page = 0;
+        while page < pages.len() {
+            let mut row = 0;
+            while row < pages[page].len() {
+                let entry = pages[page][row];
+                if entry.bits > 1 {
+                    if entry.bits <= 8 {
+                        let start = (entry.code as usize) << (8 - entry.bits);
+                        let mut i = 0;
+                        while i < 1 << (8 - entry.bits) {
+                            assert!(table.short[start + i].bits == 0);
+                            table.short[start + i] = entry;
+                            i += 1;
+                        }
+                    } else {
+                        let start = (entry.code as usize) << (16 - entry.bits);
+                        assert!(start < 1024);
+                        let mut i = 0;
+                        while i < 1 << (16 - entry.bits) {
+                            assert!(table.long[start + i].bits == 0);
+                            table.long[start + i] = entry;
+                            i += 1;
+                        }
+                    }
+                }
+                row += 1;
+            }
+            page += 1;
+        }
+        table
+    }
+    #[inline]
+    fn get(&self, prefix: u32) -> CoeffEntry {
+        let index = (prefix >> 8) as usize;
+        if index < 4 { self.long[prefix as usize] } else { self.short[index] }
+    }
+}
+
+static VLC_ZERO: PrefixTable = PrefixTable::new([
+    TABLE_B14_PAGE1, TABLE_B14_PAGE2, TABLE_B14_PAGE3, TABLE_B14_PAGE4,
+]);
+static VLC_ONE: PrefixTable = PrefixTable::new([
+    TABLE_B15_PAGE1, TABLE_B15_PAGE2, TABLE_B15_PAGE3, TABLE_B15_PAGE4,
+]);
+
+/// Shared MPEG-1 B.5 / MPEG-2 B-14 run-level codebook. `prefix` is a
+/// zero-extended 17-bit lookahead. The caller checks the returned length
+/// against actual available bits before consuming anything.
+#[inline]
+pub(crate) fn lookup_coeff(prefix: u32, table_one: bool, first: bool) -> Option<(u32, u8, i16)> {
+    if !table_one && first && prefix & (1 << 16) != 0 {
+        return Some((2, 0, if prefix & (1 << 15) == 0 { 1 } else { -1 }));
+    }
+    let entry = if table_one { VLC_ONE.get(prefix >> 1) } else { VLC_ZERO.get(prefix >> 1) };
+    if entry.bits == 0 { return None; }
+    let sign = (prefix >> (16 - entry.bits)) & 1;
+    let level = i16::from(entry.level);
+    Some((u32::from(entry.bits) + 1, entry.run, if sign == 0 { level } else { -level }))
+}
+
 // =============================================================
 // Special bit-strings (separate from the codeword tables)
 // =============================================================
@@ -1658,72 +1731,15 @@ impl DctCoeffStep {
         let peeked = br.peek_u32(peek_w).map_err(|_| Error::ShortHeader)?;
         let aligned = peeked << (MAX_CODE_LEN - peek_w);
 
-        // (1) Per-table codeword walk, longest-first.
-        let pages: [&[CoeffEntry]; 4] = match table {
-            TableSelection::TableZero => [
-                TABLE_B14_PAGE1,
-                TABLE_B14_PAGE2,
-                TABLE_B14_PAGE3,
-                TABLE_B14_PAGE4,
-            ],
-            TableSelection::TableOne => [
-                TABLE_B15_PAGE1,
-                TABLE_B15_PAGE2,
-                TABLE_B15_PAGE3,
-                TABLE_B15_PAGE4,
-            ],
-        };
-
-        // Widths to try: every distinct codeword width that appears
-        // anywhere in the selected table. We iterate longest-first so
-        // a longer match wins over a shorter prefix.
-        for &cand_w in &[16u8, 15, 14, 13, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1] {
-            let needed = u32::from(cand_w) + 1;
-            if available < needed {
-                continue;
-            }
-            let candidate = aligned >> (MAX_CODE_LEN - u32::from(cand_w));
-            for page in pages {
-                for &entry in page {
-                    if entry.bits != cand_w || u32::from(entry.code) != candidate {
-                        continue;
-                    }
-                    // Table B-14 FIRST/NEXT gating (Table B-15 has
-                    // no NOTE 2/3 alternate, so its `(0, 1)` row is
-                    // always legal).
-                    if table == TableSelection::TableZero {
-                        // `1s` (1-bit) is FIRST-only.
-                        if entry.bits == 1 && position == CoefficientPosition::Next {
-                            continue;
-                        }
-                        // `11s` (2-bit) is NEXT-only — only the `(0, 1)`
-                        // entry. Other 2-bit entries (none exist in
-                        // Table B-14) would not be filtered.
-                        if entry.bits == 2
-                            && entry.code == 0b11
-                            && position == CoefficientPosition::First
-                        {
-                            continue;
-                        }
-                    }
-                    // Consume codeword + sign bit.
-                    br.consume(u32::from(entry.bits))
-                        .map_err(|_| Error::ShortHeader)?;
-                    let sign = br.read_u1().map_err(|_| Error::ShortHeader)?;
-                    let signed_level = if sign == 0 {
-                        i16::from(entry.level)
-                    } else {
-                        -i16::from(entry.level)
-                    };
-                    return Ok(Self {
-                        symbol: DctCoeff::RunLevel {
-                            run: entry.run,
-                            signed_level,
-                            escape: false,
-                        },
-                        bit_position_after: br.bit_position(),
-                    });
-                }
+        if let Some((needed, run, signed_level)) = lookup_coeff(
+            aligned, table == TableSelection::TableOne, position == CoefficientPosition::First,
+        ) {
+            if available >= needed {
+                br.consume(needed).map_err(|_| Error::ShortHeader)?;
+                return Ok(Self {
+                    symbol: DctCoeff::RunLevel { run, signed_level, escape: false },
+                    bit_position_after: br.bit_position(),
+                });
             }
         }
 
@@ -2731,6 +2747,33 @@ mod tests {
             let step =
                 DctCoeffStep::parse(&mut br, table, CoefficientPosition::Next).expect("decode EOB");
             assert_eq!(step.symbol, DctCoeff::EndOfBlock, "table {table:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod prefix_regression {
+    use super::*;
+    #[test]
+    fn every_prefix_matches_normative_codebook_and_consumption() {
+        for (one, pages) in [
+            (false, [TABLE_B14_PAGE1, TABLE_B14_PAGE2, TABLE_B14_PAGE3, TABLE_B14_PAGE4]),
+            (true, [TABLE_B15_PAGE1, TABLE_B15_PAGE2, TABLE_B15_PAGE3, TABLE_B15_PAGE4]),
+        ] {
+            for first in [false, true] {
+                for prefix in 0..1u32 << 17 {
+                    let expected = pages.iter().flat_map(|p| p.iter()).find_map(|entry| {
+                        if !one && ((entry.bits == 1 && !first) || (entry.bits == 2 && entry.code == 3 && first)) {
+                            return None;
+                        }
+                        if prefix >> (17 - entry.bits) != u32::from(entry.code) { return None; }
+                        let sign = (prefix >> (16 - entry.bits)) & 1;
+                        let level = i16::from(entry.level);
+                        Some((u32::from(entry.bits) + 1, entry.run, if sign == 0 { level } else { -level }))
+                    });
+                    assert_eq!(lookup_coeff(prefix, one, first), expected, "table_one={one} first={first} prefix={prefix:017b}");
+                }
+            }
         }
     }
 }

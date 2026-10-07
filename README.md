@@ -1,15 +1,15 @@
 # oxideav-mpeg12video
 
-[![CI](https://github.com/OxideAV/oxideav-mpeg12video/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-mpeg12video/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-mpeg12video.svg)](https://crates.io/crates/oxideav-mpeg12video) [![docs.rs](https://docs.rs/oxideav-mpeg12video/badge.svg)](https://docs.rs/oxideav-mpeg12video) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/OxideAV/oxideav-mpeg12video/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-mpeg12video/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-mpeg12video.svg)](https://crates.io/crates/oxideav-mpeg12video) [![docs.rs](https://docs.rs/oxideav-mpeg12video/badge.svg)](https://docs.rs/oxideav-mpeg12video)
 
-Clean-room MPEG-1 Video (ISO/IEC 11172-2) and MPEG-2 Video
+MPEG-1 Video (ISO/IEC 11172-2) and MPEG-2 Video
 (ITU-T H.262 / ISO/IEC 13818-2) decode **and encode** building blocks
 for the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework. Pure Rust, no C dependencies.
 
 ## Status
 
-Clean-room rebuild. The crate implements the full MPEG-1 and MPEG-2
+This fork implements the full MPEG-1 and MPEG-2
 video decode pipeline as a set of composable, per-stage public modules
 covering the bitstream-parsing surface and the pixel-reconstruction
 math, topped by a `video_sequence()` driver
@@ -280,24 +280,36 @@ black-box reference decoder in reach accepts type-4 pictures).
 factories under both the `mpeg1video` and `mpeg2video` codec ids
 (claiming the `mp1v` / `mpg1` / `mp2v` / `mpg2` / `hdv2` / `m2v1`
 FourCC and `V_MPEG1` / `V_MPEG2` Matroska tags the container crates map
-onto them). The `decoder::Mpeg12Decoder` adapter bridges the
-whole-elementary-stream driver `decode_video_sequence` to the
-packet-oriented `Decoder` contract: it concatenates every packet's
-payload into one contiguous elementary-stream buffer (the §6.1.1.11
-display reorder spans the whole sequence, so a B-picture cannot commit
-until its trailing coded-order anchor has been decoded), runs the driver
-on `flush()`, and drains the reconstructed frames in display order —
-returning `NeedMore` before the flush and `Eof` once drained. Each
-reconstructed `FrameBuffer` converts to a tightly-packed planar Y/Cb/Cr
-`VideoFrame` (`frame_buffer_to_video_frame`, `stride == plane width`)
-stamped with a monotonic display-order presentation index, and `reset()`
-returns the decoder to a fresh state. The direct
+onto them). The `decoder::Mpeg12Decoder` adapter decodes complete pictures
+incrementally from packet bytes, retaining two reference anchors and at most
+one unpaired field, rather than a decoded whole-stream queue. `send_packet`
+parses validated initial sequence geometry; `receive_frame` reconstructs and
+returns display-order pictures before EOF. `flush` only marks the input end
+and enables the final picture/anchor drain. `reset` discards compressed data,
+timestamps, references, partial fields and published geometry.
+
+Compressed input is capped at 32 MiB, timestamp markers at 4096, and padded
+luma at 16 million pixels. Callers must drain after sending packets.
+Leading non-picture bytes retain only the three-byte start-code overlap.
+`output_video_dimensions` reports visible sequence dimensions before first
+output and exactly the last returned frame thereafter; `output_pixel_format`
+follows the same rule. Packed output excludes macroblock padding. Packet PTS
+travels with each picture through display reordering; absent PTS uses the
+monotonic display index. Unique output planes are transferred without copying,
+while retained reference planes are copied only into the caller-owned frame.
+The direct
 `decoder::make_decoder` factory and the `oxideav_core::register!`
 registry path both reach it. `tests/runtime_decoder.rs` proves the
 trait output is **sample-exact** with `decode_video_sequence` on the
 real 352×240 4:2:0 fixture (and under a split-packet feed), that both
 codec ids resolve through a `RuntimeContext`, and that `reset` makes the
 decoder reusable.
+
+`tests/streaming_reference.rs` compares all frames and counts from eleven
+MPEG-1/2 streams against FFmpeg `-idct simple`, including B pictures, field
+pairs, 4:2:2, interlacing, custom quantizers and non-macroblock visible sizes.
+It also covers split headers after 300 KiB of leading zeros, changing geometry
+and pixel format, and 256 stateful mutation/reset recoveries.
 
 ## Encoder
 
@@ -529,19 +541,21 @@ I P P P, a two-GOP I B B P | I B B P, an I B P with downloadable
 §2.4.3.2 quantiser matrices, an 11172-2 Annex C CBR two-GOP stream
 with the constrained-parameters flag set, and a **D-only** sequence
 (the one stream with no black-box reference: the reference binary
-emits zero frames for `picture_coding_type == 4`, so it is pinned
-bit-exactly and decoded sample-exactly against the encoder's own
-reconstruction)) decodes in a black-box reference decoder (strict
+emits zero frames for `picture_coding_type == 4`, so generated and legacy
+D pictures are checked against source pixels with quantization bounds))
+decodes in a black-box reference decoder (strict
 error-detection mode clean; for the field-pair streams the strict
 mode flags packets while decoding all frames — the same documented
 behaviour as the `fieldpics` conformance fixture) with its committed
 reference decode agreeing with ours at max |Δ| 2 (pure Annex A IDCT
 rounding).
-`tests/selfenc_conformance.rs` pins every stream **bit-exactly**
-(regenerate-and-compare against the committed bytes) so any
-bit-moving encoder change must consciously refresh the corpus and
-re-run the black-box validation. Getting there fixed a real encoder
-bug: the motion search could pick §7.6.3.8-illegal vectors at
+`tests/selfenc_conformance.rs` now checks every newly generated supported
+stream's complete decoded output against FFmpeg `-idct simple`, with exact
+pixel bytes and frame counts, rather than pinning incidental encoder bytes.
+The committed legacy fixtures and their original reference checks remain;
+scalable enhancement streams retain their reconstruction checks because the
+independent decoder does not support those profiles. This coverage originally
+fixed a real encoder bug: the motion search could pick §7.6.3.8-illegal vectors at
 right/bottom edge macroblocks (scored through the padding predictor,
 mirrored by our own padding decoder); it now visits only vectors
 whose whole §7.6.4 read span stays inside the coded picture. The
@@ -727,8 +741,7 @@ are pinned in the corpus, and each loop has a fuzz target.
 `mpeg1video` and `mpeg2video` codec ids beside the decoders (the
 direct `encoder::make_encoder` factory is exported too). The
 `encoder::Mpeg12Encoder` adapter drives the display-order assemblers
-behind the frame-to-packet `Encoder` contract, mirroring the runtime
-decoder's whole-elementary-stream framing: display-order frames
+behind the frame-to-packet `Encoder` contract: display-order frames
 buffered via `send_frame` are assembled at `flush()` into one
 keyframe-flagged packet carrying the finished elementary stream
 (`NeedMore` before the flush, `Eof` after the drain; two partition
@@ -769,15 +782,17 @@ factory and the registry.
   encoders), and the scalable encoders are reached through the direct
   APIs (the registry contract emits one elementary stream).
 
-## Clean-room provenance
+## Provenance
 
-Every line in `src/` traces to the ISO/IEC 13818-2:1995 (ITU-T H.262)
-and ISO/IEC 11172-2:1993 specification PDFs staged under `docs/video/`,
-plus `oxideav-core`'s `BitReader` API. An external CLI binary is used
-**only** as an opaque encoder to produce integration-test fixtures; its
-source code was not consulted. No external library source was read,
-quoted, or paraphrased.
+The upstream parser and reconstruction code derives from ISO/IEC 13818-2:1995
+(ITU-T H.262) and ISO/IEC 11172-2:1993. This fork is not wholly clean-room:
+`src/simple_idct.rs` is a safe-Rust translation of FFmpeg's 8-bit simple IDCT,
+with its Michael Niedermayer / Aaron Holtzman attribution and LGPL notice.
+The integer kernel is used for exact `-idct simple` output; the original
+floating-point transform remains only as an analysis/encoder helper.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Upstream code: MIT, see [LICENSE](LICENSE). The derived simple-IDCT kernel:
+LGPL-2.1-or-later, see [LICENSE-LGPL](LICENSE-LGPL) and its source notice.
+The combined crate is declared `MIT AND LGPL-2.1-or-later`.

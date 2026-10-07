@@ -3,7 +3,7 @@ name = "oxideav-mpeg12video"
 version = "0.0.13"
 edition = "2021"
 rust-version = "1.80"
-license = "MIT"
+license = "MIT AND LGPL-2.1-or-later"
 repository = "https://github.com/OxideAV/oxideav-mpeg12video"
 authors = ["Mark Karpeles"]
 description = "Pure-Rust MPEG-1 (ISO/IEC 11172-2) and MPEG-2 (H.262 / ISO/IEC 13818-2) video decoder and encoder for oxideav"
@@ -15,3 +15,6 @@ categories = ["multimedia::encoding", "multimedia::video"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[patch.crates-io]
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "96094a916d8b9f2695f70bb0d53e5956b8a79847" }

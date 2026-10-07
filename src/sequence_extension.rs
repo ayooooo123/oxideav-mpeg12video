@@ -279,7 +279,7 @@ impl Mpeg2Sequence {
 /// this datum, so we recompute it by adding up the fixed bit count
 /// (§6.2.2.1: 32 + 12 + 12 + 4 + 4 + 18 + 1 + 10 + 1 + 1 + 1 = 96
 /// bits) plus the optional 64-byte matrix loads.
-fn sequence_header_byte_length(buf: &[u8]) -> Result<usize> {
+pub(crate) fn sequence_header_byte_length(buf: &[u8]) -> Result<usize> {
     // Mirror the spec's syntax for everything up to the two
     // load-quant-matrix flags, then count the matrices that
     // actually follow.

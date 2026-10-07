@@ -33,9 +33,9 @@
 //!  with      C(0) = 1/√2,  C(k) = 1 for k > 0.
 //! ```
 //!
-//! The OxideAV implementation evaluates the literal double sum at
-//! `f64` precision; the cosines are cached once at module load through
-//! the precomputed [`COS_TABLE`].
+//! Production uses the integer `simple` IDCT, matching FFmpeg's explicit
+//! `-idct simple` oracle. The floating-point transforms remain available
+//! for numerical/encoder analysis, not for production reconstruction.
 //!
 //! ## Data ranges (ISO/IEC 13818-2 §A and §7.4.3 / §7.5)
 //!
@@ -64,20 +64,11 @@
 //!    analogue to the "infinite-precision" reference IEEE 1180 / P1180
 //!    compares candidates against.
 //!
-//! 2. [`idct_candidate_f64`] — the **fast separable 1-D-pass IDCT**
-//!    the production decoder uses internally. It applies an 8-point
-//!    1-D IDCT to each of the 8 rows, then an 8-point 1-D IDCT to
-//!    each of the 8 resulting columns (`O(N³)` total). The decomposition
-//!    is mathematically equivalent to the direct 4-D summation — the
-//!    only difference is the order in which the `cos·cos` products
-//!    are accumulated, which produces a slightly different `f64`
-//!    rounding sequence.
+//! 2. [`idct_candidate_f64`] — a separable floating-point transform for
+//!    numerical analysis and comparison with the direct reference.
 //!
-//! 3. [`idct_8x8`] — the **integer IDCT** used by the downstream
-//!    decoder pipeline. It calls [`idct_candidate_f64`], rounds every
-//!    output to the nearest integer (ties away from zero, matching
-//!    the spec's `Round(x)` convention), then saturates the result
-//!    into the §7.5 9-bit pel range `[-256, +255]`.
+//! 3. [`idct_8x8`] — the production integer `simple` transform; its
+//!    staged rounding matches the independent FFmpeg reference exactly.
 //!
 //! The IEEE 1180 / P1180/D2 statistical accuracy test compares a
 //! candidate IDCT against the direct (reference) double-precision
@@ -248,15 +239,6 @@ pub fn saturate_input(value: i32) -> i32 {
     value.clamp(F_INPUT_MIN, F_INPUT_MAX)
 }
 
-/// Round a real-valued IDCT output to the nearest integer using the
-/// spec's `Round(x)` convention (ties away from zero).
-///
-/// `f64::round` already implements ties-away-from-zero on stable Rust,
-/// matching the `Round` operator in ISO/IEC 13818-2 §4.1.
-#[inline]
-fn round_to_int(value: f64) -> i32 {
-    value.round() as i32
-}
 
 /// Double-precision §A 8×8 IDCT — the **direct 4-D reference**
 /// transform.
@@ -328,9 +310,8 @@ fn idct_1d(input: &[f64; 8]) -> [f64; 8] {
 /// Computes the IDCT as eight row-IDCTs followed by eight
 /// column-IDCTs (the standard `O(N³)` decomposition of the 2-D
 /// transform). Mathematically identical to [`idct_reference_f64`];
-/// differs only in `f64` rounding order. This is the kernel the
-/// production [`idct_8x8`] integer IDCT calls before rounding and
-/// saturating.
+/// differs only in `f64` rounding order. Production reconstruction uses
+/// the separate integer `simple` transform, not this analysis kernel.
 ///
 /// The IEEE 1180 conformance harness measures candidate-vs-reference
 /// error using *this* function as the candidate (against the direct
@@ -364,35 +345,16 @@ pub fn idct_candidate_f64(input: &[[f64; 8]; 8]) -> [[f64; 8]; 8] {
 /// `oxideav-mpeg12video` decoder pipeline (Figure 7-1, between the
 /// §7.4 dequantiser and the §7.6 macroblock pipeline).
 ///
-/// Inputs `F[v][u]` are 12-bit signed coefficients in `[-2048,
-/// +2047]`. The IDCT applies the §A formula via
-/// [`idct_candidate_f64`], rounds the per-pixel result to the nearest
-/// integer using the §4.1 `Round` operator, then saturates the result
-/// to the 9-bit signed pel range `[-256, +255]` per §7.5.
+/// Inputs are saturated 12-bit coefficients. The two integer passes use
+/// FFmpeg's `simple` rounding and narrow row intermediates to i16.
+/// The final residual is saturated to [-256, 255] before prediction add.
 ///
 /// Callers must have already applied the §7.4.3 saturation (which
 /// guarantees the input range) and the §7.4.4 MPEG-2 mismatch-control
 /// (`F[7][7]` parity toggle) or the MPEG-1 §2.4.4 per-coefficient
 /// oddification before invoking the IDCT.
 pub fn idct_8x8(input: &[[i16; 8]; 8]) -> [[i16; 8]; 8] {
-    // Promote to f64 once; the IDCT formula factor naturally produces
-    // an unrounded sample value that we round + clamp here.
-    let mut promoted = [[0.0f64; 8]; 8];
-    for v in 0..8usize {
-        for u in 0..8usize {
-            promoted[v][u] = f64::from(input[v][u]);
-        }
-    }
-    let real = idct_candidate_f64(&promoted);
-    let mut out = [[0i16; 8]; 8];
-    for y in 0..8usize {
-        for x in 0..8usize {
-            let clamped = saturate_output(round_to_int(real[y][x]));
-            // The clamp guarantees `clamped` fits in i16.
-            out[y][x] = clamped as i16;
-        }
-    }
-    out
+    crate::simple_idct::idct(input)
 }
 
 /// Convenience wrapper around [`idct_8x8`] that accepts an `i32`

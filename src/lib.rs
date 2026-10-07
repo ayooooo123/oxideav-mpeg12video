@@ -1,8 +1,11 @@
 //! # oxideav-mpeg12video
 //!
-//! Clean-room MPEG-1 Video (ISO/IEC 11172-2) / MPEG-2 Video
+//! MPEG-1 Video (ISO/IEC 11172-2) / MPEG-2 Video
 //! (ITU-T H.262 / ISO/IEC 13818-2) decoder and encoder for the
 //! [oxideav](https://github.com/OxideAV/oxideav) framework.
+//!
+//! This fork uses an LGPL-2.1-or-later simple-IDCT kernel derived from FFmpeg;
+//! see `simple_idct.rs` and `LICENSE-LGPL`. The remaining upstream code is MIT.
 //!
 //! **Status:** rebuild rounds 1–251 — structural sequence-layer
 //! parsers, the `group_of_pictures_header()` layer, the
@@ -392,6 +395,8 @@ pub mod frame_field_encoder;
 pub mod gop_header;
 #[doc(hidden)] // internal: §A 8x8 IDCT stage
 pub mod idct;
+mod simple_idct;
+mod streaming;
 pub mod inter_encoder;
 pub mod inter_reconstruction;
 pub mod intra_encoder;

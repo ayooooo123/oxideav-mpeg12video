@@ -6,6 +6,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed — PearTube streaming fork
+
+- Decode and reorder pictures during packet draining instead of retaining the
+  whole elementary stream until flush. Bound compressed input, timestamps and
+  picture geometry; reset all state and preserve incomplete-field EOF behavior.
+- Publish validated visible geometry during `send_packet`, and keep geometry
+  and pixel format attached to the exact returned frame across sequence changes.
+- Use the attributed LGPL-2.1-or-later integer simple-IDCT kernel for exact
+  FFmpeg `-idct simple` output; preserve field, quantizer and reference semantics.
+- Replace coefficient width/table scans with immutable 8-bit primary and bounded
+  second-level lookups, exhaustively checked against both normative codebooks.
+- Replace encoder-byte snapshots with complete independent decoded-output
+  checks; keep legacy fixtures and reference coverage. Add full-frame streaming,
+  changing-geometry, leading-zero and mutation/reset regressions.
+
 ### Other
 
 - README + CHANGELOG — round 456: interlaced 4:2:2 / 4:4:4, vertical_size > 2800, typed runtime options, the three scalable loops + encoders, arbitrary slice structures; Not-yet-supported rewritten to the remaining scalable corners

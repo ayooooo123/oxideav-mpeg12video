@@ -103,6 +103,18 @@ impl Plane {
         out
     }
 
+    pub(crate) fn into_packed_rect(mut self, rect_width: usize, rect_height: usize) -> Vec<u8> {
+        let w = rect_width.min(self.width);
+        let h = rect_height.min(self.height);
+        if w != self.width {
+            for row in 1..h {
+                self.samples.copy_within(row * self.width..row * self.width + w, row * w);
+            }
+        }
+        self.samples.truncate(w * h);
+        self.samples
+    }
+
     /// Sample at `(x, y)`. Out-of-bounds coordinates return `None`.
     pub fn get(&self, x: usize, y: usize) -> Option<u8> {
         if x >= self.width || y >= self.height {

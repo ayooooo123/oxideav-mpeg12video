@@ -178,6 +178,87 @@ fn reset_then_seek_to_sequence_or_mid_gop_matches_independent_output() {
     }
 }
 
+/// §6.2.3.2 quant_matrix_extension loading only a non-intra matrix, whose
+/// 64 values are transmitted in zigzag order.
+fn non_intra_matrix_extension(matrix: &[u8; 64]) -> Vec<u8> {
+    // extension_start_code_identifier 0011, load_intra 0, load_non_intra 1.
+    let mut bits = vec![false, false, true, true, false, true];
+    for value in matrix {
+        bits.extend((0..8).rev().map(|shift| (value >> shift) & 1 == 1));
+    }
+    bits.extend([false, false]); // no chroma matrices
+    let mut out = vec![0, 0, 1, 0xB5];
+    out.extend(bits.chunks(8).map(|byte| {
+        byte.iter().fold(0u8, |acc, &bit| (acc << 1) | u8::from(bit)) << (8 - byte.len())
+    }));
+    out
+}
+
+#[test]
+fn seek_applies_matrix_download_of_a_discarded_leading_picture() {
+    let data = std::fs::read(fixture("mpeg2-ibbp-96x64.m2v")).unwrap();
+    let codes: Vec<(usize, u8)> = data.windows(4).enumerate()
+        .filter(|(_, w)| w[..3] == [0, 0, 1]).map(|(i, w)| (i, w[3])).collect();
+    let next = |from: usize, code: Option<u8>| codes.iter()
+        .find(|&&(i, c)| i > from && code.map_or(true, |code| c == code)).unwrap().0;
+    // Enter at the second sequence. Its GOP is open, so the B-pictures
+    // coded after its I-picture lack a forward reference and are discarded.
+    let seek = codes.iter().filter(|&&(_, c)| c == 0xB3).nth(1).unwrap().0;
+    assert_eq!(data[next(seek, Some(0xB8)) + 7] & 0x40, 0, "entry GOP must be open");
+    let pictures: Vec<usize> = codes.iter().filter(|&&(i, c)| i > seek && c == 0).map(|&(i, _)| i).collect();
+    let kind = |i: usize| (data[i + 5] >> 3) & 7;
+    assert_eq!((kind(pictures[0]), kind(pictures[1])), (1, 3), "I then a leading B");
+    // Download a new non-intra matrix in that discarded B-picture, after
+    // its picture_coding_extension; it governs the retained P/B pictures.
+    let coding_extension = next(pictures[1], Some(0xB5));
+    assert_eq!(data[coding_extension + 4] >> 4, 8, "picture_coding_extension");
+    let at = next(coding_extension, None);
+    let matrix: [u8; 64] = std::array::from_fn(|i| 24 + (i % 8) as u8 * 4);
+    let mut modified = data[..at].to_vec();
+    modified.extend(non_intra_matrix_extension(&matrix));
+    modified.extend_from_slice(&data[at..]);
+
+    let dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir).join("evidence")
+        .join(format!("mpeg12-matrix-seek-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let oracle = |name: &str, bytes: &[u8]| {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        reference_path(&path, "yuv420p")
+    };
+    let full = oracle("download.m2v", &modified);
+    let entered = oracle("download-entry.m2v", &modified[seek..]);
+    let plain = oracle("plain-entry.m2v", &data[seek..]);
+    assert_ne!(entered, plain, "the discarded picture's download must change retained output");
+    assert!(entered.len() / (96 * 64 * 3 / 2) < pictures.len(), "FFmpeg must discard leading pictures");
+
+    let mut dec = decoder();
+    let mut actual = Vec::new();
+    for chunk in modified.chunks(113) {
+        dec.send_packet(&packet(chunk)).unwrap();
+        drain(&mut dec, &mut actual).unwrap();
+    }
+    dec.flush().unwrap();
+    drain(&mut dec, &mut actual).unwrap();
+    assert_eq!(actual, full, "download in a decoded picture");
+    dec.reset().unwrap();
+    // Populate references, then seek.
+    for chunk in modified[..seek - 3].chunks(997) {
+        dec.send_packet(&packet(chunk)).unwrap();
+        drain(&mut dec, &mut Vec::new()).unwrap();
+    }
+    dec.reset().unwrap();
+    let mut actual = Vec::new();
+    for chunk in modified[seek..].chunks(113) {
+        dec.send_packet(&packet(chunk)).unwrap();
+        drain(&mut dec, &mut actual).unwrap();
+    }
+    dec.flush().unwrap();
+    drain(&mut dec, &mut actual).unwrap();
+    assert_eq!(actual, entered, "download in a discarded picture");
+}
+
 #[test]
 fn extended_geometry_is_validated_without_silent_mpeg1_fallback() {
     let data = std::fs::read(fixture("mpeg2-100x62.m2v")).unwrap();

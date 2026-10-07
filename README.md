@@ -291,8 +291,9 @@ timestamps, references, partial fields and published geometry.
 Packet input may begin anywhere, for example after a seek. Like FFmpeg, the
 adapter discards pictures before the first sequence header, P/B pictures
 before any anchor, and open-GOP leading B-pictures without a forward
-reference. A closed GOP's leading B-pictures predict only backward and
-decode, also in the strict whole-stream API.
+reference. A discarded picture's §6.3.11 quantiser-matrix downloads still
+apply to later pictures, as in FFmpeg. A closed GOP's leading B-pictures
+predict only backward and decode, also in the strict whole-stream API.
 
 Timestamps follow ISO/IEC 13818-1 association: a packet's PTS/DTS belong to
 the first picture whose start code begins in it. The output chooses between

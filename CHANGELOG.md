@@ -25,8 +25,9 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   exact §6.3.10 durations in the packet time base. Remove the display-index
   fallback that mixed picture counters with container timestamps.
 - Packet decoding tolerates random access: pictures before a sequence header,
-  P/B pictures before an anchor and open-GOP leading B-pictures are skipped.
-  Closed-GOP leading B-pictures decode backward-only in both APIs.
+  P/B pictures before an anchor and open-GOP leading B-pictures are skipped,
+  still applying their §6.3.11 quantiser-matrix downloads. Closed-GOP leading
+  B-pictures decode backward-only in both APIs.
 
 ### Other
 

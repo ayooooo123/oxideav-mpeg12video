@@ -289,6 +289,13 @@ impl PictureDecoder {
     pub(crate) fn picture(&mut self, region: &[u8], stamp: Stamp) -> Result<Option<Released>> {
         let geometry = self.geometry.ok_or(Error::InvalidBitstream("picture before sequence header"))?;
         let coding_type = Mpeg2PictureHeader::parse(region)?.picture_coding_type;
+        // §6.3.11: a quant_matrix_extension download persists until the next
+        // sequence header or download, so it applies even when the skip below
+        // discards its picture. FFmpeg likewise parses extensions before its
+        // slice-level skip.
+        if let SequenceGeometry::Mpeg2(params, _) = geometry {
+            apply_quant_matrix_extensions(region, params.chroma_format, &mut self.matrices)?;
+        }
         // After random access, drop pictures whose references precede the
         // entry point, as FFmpeg does: P/B before any anchor, and the leading
         // B-pictures of an open GOP. A second field follows its first.
@@ -318,7 +325,6 @@ impl PictureDecoder {
             }
             SequenceGeometry::Mpeg2(params, _) => {
                 let (header, ext) = Mpeg2PictureHeader::parse_with_extension(region)?;
-                apply_quant_matrix_extensions(region, params.chroma_format, &mut self.matrices)?;
                 let decoded = if ext.picture_structure == PictureStructure::Frame {
                     if self.pending_field.is_some() {
                         return Err(Error::InvalidBitstream("frame picture interrupts field pair"));

@@ -10,8 +10,11 @@ fn packet(data: &[u8]) -> Packet { Packet::new(0, TimeBase::new(1, 25), data.to_
 fn decoder() -> Mpeg12Decoder { Mpeg12Decoder::new(CodecId::new("mpeg2video")) }
 fn reference(name: &str) -> Vec<u8> {
     let format = if name.contains("422") { "yuv422p" } else { "yuv420p" };
+    reference_path(&fixture(name), format)
+}
+fn reference_path(path: &std::path::Path, format: &str) -> Vec<u8> {
     let out = Command::new("ffmpeg").args(["-v", "error", "-nostdin", "-idct", "simple", "-i"])
-        .arg(fixture(name)).args(["-map", "0:v:0", "-fps_mode", "passthrough", "-pix_fmt", format, "-f", "rawvideo", "-"])
+        .arg(path).args(["-map", "0:v:0", "-fps_mode", "passthrough", "-pix_fmt", format, "-f", "rawvideo", "-"])
         .output().expect("FFmpeg is required for the independent oracle");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     out.stdout
@@ -132,4 +135,67 @@ fn stateful_mutations_and_reset_recover_exact_output() {
         assert_eq!(actual, expected, "reset recovery after mutation {iteration}");
         dec.reset().unwrap();
     }
+}
+
+#[test]
+fn reset_then_seek_to_sequence_or_mid_gop_matches_independent_output() {
+    let data = std::fs::read(fixture("mpeg2-ibbp-96x64.m2v")).unwrap();
+    let mut points: Vec<_> = data.windows(4).enumerate()
+        .filter_map(|(i,w)| (w == [0,0,1,0xB3]).then_some(i)).skip(1).collect();
+    assert_eq!(points.len(), 2, "fixture must exercise both later GOPs");
+    // A mid-GOP P-picture: no sequence header or reference precedes it.
+    let pictures: Vec<_> = data.windows(4).enumerate()
+        .filter_map(|(i,w)| (w == [0,0,1,0]).then_some(i)).collect();
+    assert_eq!((data[pictures[4] + 5] >> 3) & 7, 2, "fifth coded picture is P");
+    points.push(pictures[4]);
+    let dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir).join("evidence")
+        .join(format!("mpeg12-seek-{}",std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut dec = decoder();
+    for offset in points {
+        // Populate references and leave a partial picture before seeking.
+        for chunk in data[..offset-3].chunks(997) {
+            dec.send_packet(&packet(chunk)).unwrap();
+            drain(&mut dec,&mut Vec::new()).unwrap();
+        }
+        dec.reset().unwrap();
+        assert_eq!(dec.output_video_dimensions(),None);
+        let path = dir.join(format!("{offset}.m2v"));
+        std::fs::write(&path,&data[offset..]).unwrap();
+        let expected = reference_path(&path,"yuv420p");
+        let mut actual = Vec::new();
+        for chunk in data[offset..].chunks(113) {
+            dec.send_packet(&packet(chunk)).unwrap();
+            drain(&mut dec,&mut actual).unwrap();
+        }
+        dec.flush().unwrap();
+        drain(&mut dec,&mut actual).unwrap();
+        std::fs::write(dir.join(format!("{offset}.decoded.yuv")),&actual).unwrap();
+        std::fs::write(dir.join(format!("{offset}.ffmpeg.yuv")),&expected).unwrap();
+        assert_eq!(actual,expected,"complete output after seek to byte {offset}");
+        dec.reset().unwrap();
+    }
+}
+
+#[test]
+fn extended_geometry_is_validated_without_silent_mpeg1_fallback() {
+    let data = std::fs::read(fixture("mpeg2-100x62.m2v")).unwrap();
+    let picture = data.windows(4).position(|w| w == [0,0,1,0]).unwrap();
+    let extension = data.windows(4).position(|w| w == [0,0,1,0xB5]).unwrap();
+    let mut header = data[..picture].to_vec();
+    // horizontal_size_extension's low bit precedes vertical_size_extension.
+    header[extension + 6] |= 0x80;
+    let mut dec = decoder();
+    for byte in &header { dec.send_packet(&packet(&[*byte])).unwrap(); }
+    assert_eq!(dec.output_video_dimensions(),Some((4196,62)));
+    assert_eq!(dec.output_pixel_format(),Some(PixelFormat::Yuv420P));
+    dec.reset().unwrap();
+    // A missing required extension marker is malformed, not MPEG-1.
+    header[extension + 7] &= !1;
+    assert!(dec.send_packet(&packet(&header)).is_err());
+    assert_eq!(dec.output_video_dimensions(),None);
+    dec.reset().unwrap();
+    dec.send_packet(&packet(&data[..picture])).unwrap();
+    assert_eq!(dec.output_video_dimensions(),Some((100,62)));
 }

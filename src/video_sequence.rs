@@ -175,23 +175,42 @@ impl DecodedFrame {
 ///   `sequence_header()` / `sequence_extension()` pair, if a P/B picture
 ///   appears before any anchor exists (no forward reference, §6.1.1.11
 ///   *"the first coded frame after a sequence header shall not be a
-///   B-frame"* / a P needs a forward anchor), or from any lower-layer
-///   parse.
+///   B-frame"* / a P needs a forward anchor), if an open GOP's leading
+///   B-picture lacks its forward anchor, or from any lower-layer parse.
+///   A closed GOP's leading B-pictures predict only backward (§6.3.8)
+///   and decode.
 /// * [`Error::ShortHeader`] on truncation.
 pub fn decode_video_sequence(stream: &[u8]) -> Result<Vec<DecodedFrame>> {
     let mut decoder = crate::streaming::StreamDecoder::default();
     let mut output = Vec::new();
+    let take = |released: Released| std::sync::Arc::try_unwrap(released.picture)
+        .map(|picture| picture.decoded).unwrap_or_else(|picture| picture.decoded.clone());
     for chunk in stream.chunks(16 * 1024) {
-        decoder.push(chunk, None)?;
-        while let Some(frame) = decoder.next()? {
-            output.push(frame.decoded.clone());
+        decoder.push(chunk, Stamp::default())?;
+        while let Some(released) = decoder.next()? {
+            output.push(take(released));
         }
     }
     decoder.finish();
-    while let Some(frame) = decoder.next()? {
-        output.push(frame.decoded.clone());
+    while let Some(released) = decoder.next()? {
+        output.push(take(released));
     }
     Ok(output)
+}
+
+/// Timestamps of the packet in which a picture's start code begins. ISO/IEC
+/// 13818-1 §2.4.3.7: they refer to the first picture commencing in a packet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Stamp {
+    pub pts: Option<i64>,
+    pub dts: Option<i64>,
+}
+
+impl Stamp {
+    /// An absent DTS equals the PTS (ISO/IEC 13818-1 §2.4.3.7).
+    fn decode_time(self) -> Option<i64> {
+        self.dts.or(self.pts)
+    }
 }
 
 /// Metadata and samples share reference ownership: the reorder hold is the
@@ -199,23 +218,54 @@ pub fn decode_video_sequence(stream: &[u8]) -> Result<Vec<DecodedFrame>> {
 #[derive(Debug)]
 pub(crate) struct OutputPicture {
     pub decoded: DecodedFrame,
-    pub pts: Option<i64>,
+    pub stamp: Stamp,
+    /// Display duration in seconds as `(numerator, denominator)`: the
+    /// §6.3.10 field/frame repeats at the Table 6-4 rate. `None` when the
+    /// sequence uses a reserved `frame_rate_code`.
+    pub duration: Option<(u64, u64)>,
+}
+
+/// A display-order picture and the decode time that released it. In the
+/// ISO/IEC 13818-1 decoder model a B-picture is presented at its own decode
+/// time and an I/P anchor when the next anchor is decoded.
+#[derive(Debug)]
+pub(crate) struct Released {
+    pub picture: std::sync::Arc<OutputPicture>,
+    pub release_dts: Option<i64>,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct PictureDecoder {
     geometry: Option<SequenceGeometry>,
+    /// Frames per second as `(numerator, denominator)`.
+    frame_rate: Option<(u32, u32)>,
     matrices: QuantiserMatrixState,
     forward: Option<std::sync::Arc<OutputPicture>>,
     backward: Option<std::sync::Arc<OutputPicture>>,
     held: bool,
     pending_field: Option<PendingField>,
-    field_pts: Option<i64>,
+    field_stamp: Stamp,
+    /// §6.3.8 `closed_gop` of the current GOP.
+    closed_gop: bool,
+    /// Input may begin at any picture rather than at a sequence start.
+    random_access: bool,
 }
 
 impl PictureDecoder {
+    pub(crate) fn random_access() -> Self {
+        Self { random_access: true, ..Self::default() }
+    }
+
+    pub(crate) fn is_random_access(&self) -> bool {
+        self.random_access
+    }
+
+    pub(crate) fn gop(&mut self, closed: bool) {
+        self.closed_gop = closed;
+    }
+
     pub(crate) fn sequence(&mut self, data: &[u8]) -> Result<()> {
-        let geometry = sequence_geometry_at(data)?;
+        let (geometry, frame_rate) = sequence_geometry_at(data)?;
         let (w, h, _) = geometry.dimensions();
         // Bound reconstruction storage before any frame/slice allocation.
         // H.262 High Level (1920x1152) fits comfortably; also retain the
@@ -228,6 +278,7 @@ impl PictureDecoder {
         }
         self.matrices = geometry.initial_matrices();
         self.geometry = Some(geometry);
+        self.frame_rate = frame_rate;
         Ok(())
     }
 
@@ -235,57 +286,85 @@ impl PictureDecoder {
         self.geometry.map(|g| g.dimensions())
     }
 
-    pub(crate) fn picture(&mut self, region: &[u8], pts: Option<i64>) -> Result<Option<std::sync::Arc<OutputPicture>>> {
+    pub(crate) fn picture(&mut self, region: &[u8], stamp: Stamp) -> Result<Option<Released>> {
         let geometry = self.geometry.ok_or(Error::InvalidBitstream("picture before sequence header"))?;
-        let forward = self.forward.as_ref().map(|f| &f.decoded.frame);
+        let coding_type = Mpeg2PictureHeader::parse(region)?.picture_coding_type;
+        // After random access, drop pictures whose references precede the
+        // entry point, as FFmpeg does: P/B before any anchor, and the leading
+        // B-pictures of an open GOP. A second field follows its first.
+        if self.random_access && self.pending_field.is_none() {
+            let unreachable = match coding_type {
+                PictureCodingType::Predictive => self.backward.is_none(),
+                PictureCodingType::Bidirectional => {
+                    self.backward.is_none() || (self.forward.is_none() && !self.closed_gop)
+                }
+                PictureCodingType::Intra | PictureCodingType::DcIntra => false,
+            };
+            if unreachable {
+                return Ok(None);
+            }
+        }
         let backward = self.backward.as_ref().map(|f| &f.decoded.frame);
-        let mut frame_pts = pts;
-        let decoded = match geometry {
+        // §6.3.8: a closed GOP's leading B-pictures predict only backward, so
+        // a missing forward anchor is never read.
+        let closed_leading_b = self.closed_gop && matches!(coding_type, PictureCodingType::Bidirectional);
+        let forward = self.forward.as_ref().map(|f| &f.decoded.frame)
+            .or(if closed_leading_b { backward } else { None });
+        let mut frame_stamp = stamp;
+        let (decoded, progressive_sequence) = match geometry {
             SequenceGeometry::Mpeg1(params) => {
                 let header = Mpeg2PictureHeader::parse(region)?;
-                reconstruct_mpeg1_picture(region, &header, &params, forward, backward)?
+                (reconstruct_mpeg1_picture(region, &header, &params, forward, backward)?, true)
             }
             SequenceGeometry::Mpeg2(params, _) => {
                 let (header, ext) = Mpeg2PictureHeader::parse_with_extension(region)?;
                 apply_quant_matrix_extensions(region, params.chroma_format, &mut self.matrices)?;
-                if ext.picture_structure == PictureStructure::Frame {
+                let decoded = if ext.picture_structure == PictureStructure::Frame {
                     if self.pending_field.is_some() {
                         return Err(Error::InvalidBitstream("frame picture interrupts field pair"));
                     }
                     reconstruct_picture(region, &header, &ext, params, forward, backward, &self.matrices)?
                 } else {
-                    let first = self.pending_field.is_none();
-                    if first { self.field_pts = pts; }
+                    // A field pair displays as one frame at its first field's time.
+                    if self.pending_field.is_none() { self.field_stamp = stamp; }
                     let frame = reconstruct_field_pair(region, &header, &ext, params, forward, backward,
                         &mut self.pending_field, &self.matrices)?;
                     let Some(frame) = frame else { return Ok(None); };
-                    frame_pts = self.field_pts.take().or(pts);
+                    frame_stamp = std::mem::take(&mut self.field_stamp);
                     frame
-                }
+                };
+                (decoded, params.progressive_sequence)
             }
         };
-        let frame = std::sync::Arc::new(OutputPicture { decoded, pts: frame_pts });
-        match frame.decoded.picture_coding_type {
-            PictureCodingType::Bidirectional | PictureCodingType::DcIntra => Ok(Some(frame)),
+        // §6.3.10: progressive sequences repeat whole frames; interlaced
+        // ones repeat the first field.
+        let fields = if progressive_sequence { 2 * decoded.output_frame_count() } else { decoded.output_field_count() };
+        let duration = self.frame_rate.map(|(num, den)| (u64::from(fields) * u64::from(den), 2 * u64::from(num)));
+        let release_dts = frame_stamp.decode_time();
+        let frame = std::sync::Arc::new(OutputPicture { decoded, stamp: frame_stamp, duration });
+        let output = match frame.decoded.picture_coding_type {
+            PictureCodingType::Bidirectional | PictureCodingType::DcIntra => Some(frame),
             PictureCodingType::Intra | PictureCodingType::Predictive => {
                 let output = if self.held { self.backward.clone() } else { None };
                 self.forward = self.backward.replace(frame);
                 self.held = true;
-                Ok(output)
+                output
             }
-        }
+        };
+        Ok(output.map(|picture| Released { picture, release_dts }))
     }
 
-    pub(crate) fn end(&mut self) -> Result<Option<std::sync::Arc<OutputPicture>>> {
+    /// Release the held anchor at a sequence end or end of input.
+    pub(crate) fn end(&mut self) -> Option<Released> {
         // An incomplete final field cannot form a display frame. Preserve the
         // whole-stream API's truncated-tail behavior without retaining it.
         self.pending_field = None;
-        self.field_pts = None;
+        self.field_stamp = Stamp::default();
         let output = if self.held { self.backward.take() } else { None };
         self.forward = None;
         self.backward = None;
         self.held = false;
-        Ok(output)
+        output.map(|picture| Released { picture, release_dts: None })
     }
 }
 
@@ -555,8 +634,8 @@ impl SequenceGeometry {
 /// ISO/IEC 13818-2 sequence (§6.1.1.6 *"sequence_header() shall be
 /// followed by sequence_extension()"*); its absence makes it an
 /// ISO/IEC 11172-2 sequence, whose geometry and quantiser matrices
-/// come from the header alone (§2.4.2.3).
-fn sequence_geometry_at(buf: &[u8]) -> Result<SequenceGeometry> {
+/// come from the header alone (§2.4.2.3). Also returns the frame rate.
+fn sequence_geometry_at(buf: &[u8]) -> Result<(SequenceGeometry, Option<(u32, u32)>)> {
     // Only absence of an extension selects MPEG-1. A split, truncated or
     // malformed MPEG-2 extension must never silently downgrade the stream.
     let after = crate::sequence_extension::sequence_header_byte_length(buf)?;
@@ -584,7 +663,9 @@ fn sequence_geometry_at(buf: &[u8]) -> Result<SequenceGeometry> {
                     chroma_non_intra: None,
                 };
             header_loads.apply(&mut matrices, seq.extension.chroma_format);
-            Ok(SequenceGeometry::Mpeg2(sequence_geometry(&seq), matrices))
+            let rate = frame_rate(seq.header.frame_rate_code,
+                seq.extension.frame_rate_extension_n, seq.extension.frame_rate_extension_d);
+            Ok((SequenceGeometry::Mpeg2(sequence_geometry(&seq), matrices), rate))
     } else {
             // No sequence_extension: ISO/IEC 11172-2. Parse the bare
             // header (geometry + optional downloadable matrices, both
@@ -601,13 +682,31 @@ fn sequence_geometry_at(buf: &[u8]) -> Result<SequenceGeometry> {
                 .non_intra_quant
                 .map(to_raster)
                 .unwrap_or([[16u8; 8]; 8]);
-            Ok(SequenceGeometry::Mpeg1(Mpeg1PictureParams {
+            Ok((SequenceGeometry::Mpeg1(Mpeg1PictureParams {
                 width: header.width as usize,
                 height: header.height as usize,
                 intra_quant,
                 non_intra_quant,
-            }))
+            }), frame_rate(header.frame_rate_code, 0, 0)))
         }
+}
+
+/// Table 6-4 (ISO/IEC 11172-2 §2.4.3.2 for MPEG-1) in frames per second,
+/// scaled by the §6.3.5 `frame_rate_extension_n/_d`. Reserved codes have no
+/// defined rate.
+fn frame_rate(code: u8, extension_n: u8, extension_d: u8) -> Option<(u32, u32)> {
+    let (num, den) = match code {
+        1 => (24_000, 1001),
+        2 => (24, 1),
+        3 => (25, 1),
+        4 => (30_000, 1001),
+        5 => (30, 1),
+        6 => (50, 1),
+        7 => (60_000, 1001),
+        8 => (60, 1),
+        _ => return None,
+    };
+    Some((num * (u32::from(extension_n) + 1), den * (u32::from(extension_d) + 1)))
 }
 
 /// §6.1.2.2 restricted slice structure — *"every macroblock in the

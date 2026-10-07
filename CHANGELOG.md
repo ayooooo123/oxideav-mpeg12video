@@ -20,6 +20,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - Replace encoder-byte snapshots with complete independent decoded-output
   checks; keep legacy fixtures and reference coverage. Add full-frame streaming,
   changing-geometry, leading-zero and mutation/reset regressions.
+- Associate packet PTS/DTS with the first picture commencing in each packet;
+  choose output times as FFmpeg `guess_correct_pts` does and fill gaps from
+  exact §6.3.10 durations in the packet time base. Remove the display-index
+  fallback that mixed picture counters with container timestamps.
+- Packet decoding tolerates random access: pictures before a sequence header,
+  P/B pictures before an anchor and open-GOP leading B-pictures are skipped.
+  Closed-GOP leading B-pictures decode backward-only in both APIs.
 
 ### Other
 

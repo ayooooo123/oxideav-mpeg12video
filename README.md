@@ -288,14 +288,28 @@ returns display-order pictures before EOF. `flush` only marks the input end
 and enables the final picture/anchor drain. `reset` discards compressed data,
 timestamps, references, partial fields and published geometry.
 
+Packet input may begin anywhere, for example after a seek. Like FFmpeg, the
+adapter discards pictures before the first sequence header, P/B pictures
+before any anchor, and open-GOP leading B-pictures without a forward
+reference. A closed GOP's leading B-pictures predict only backward and
+decode, also in the strict whole-stream API.
+
+Timestamps follow ISO/IEC 13818-1 association: a packet's PTS/DTS belong to
+the first picture whose start code begins in it. The output chooses between
+the picture's own PTS and the DTS that released it, as FFmpeg's
+`guess_correct_pts` does, so demuxers that label coded-order times as PTS
+still give increasing display times. Missing values continue exactly from the
+previous frame's §6.3.10 duration in the packet time base, including
+`repeat_first_field`. An untimed epoch starts at zero; no picture counter is
+mixed with container timestamps.
+
 Compressed input is capped at 32 MiB, timestamp markers at 4096, and padded
 luma at 16 million pixels. Callers must drain after sending packets.
 Leading non-picture bytes retain only the three-byte start-code overlap.
 `output_video_dimensions` reports visible sequence dimensions before first
 output and exactly the last returned frame thereafter; `output_pixel_format`
-follows the same rule. Packed output excludes macroblock padding. Packet PTS
-travels with each picture through display reordering; absent PTS uses the
-monotonic display index. Unique output planes are transferred without copying,
+follows the same rule. Packed output excludes macroblock padding. Unique
+output planes are transferred without copying,
 while retained reference planes are copied only into the caller-owned frame.
 The direct
 `decoder::make_decoder` factory and the `oxideav_core::register!`
@@ -310,6 +324,11 @@ MPEG-1/2 streams against FFmpeg `-idct simple`, including B pictures, field
 pairs, 4:2:2, interlacing, custom quantizers and non-macroblock visible sizes.
 It also covers split headers after 300 KiB of leading zeros, changing geometry
 and pixel format, and 256 stateful mutation/reset recoveries.
+`reset` followed by entry at a later sequence or a mid-GOP P-picture matches
+FFmpeg's complete output. `tests/presentation_timestamps.rs` checks sparse
+PES stamps through B reordering and open GOPs against bitstream-derived times,
+coded-order labels, and untimed field-pair, MPEG-1, 3:2-pulldown and
+progressive-repeat durations against FFmpeg.
 
 ## Encoder
 

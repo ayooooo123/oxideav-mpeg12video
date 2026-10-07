@@ -245,12 +245,7 @@ fn an_unreduced_time_base_times_frames_like_its_reduced_form() {
     let m = i64::MAX;
     let mut data = std::fs::read(fixture("mpeg2-ibbp-96x64.m2v")).unwrap();
     let mut ntsc = std::fs::read(generated("ntsc.m2v", 12, &[("b_between", "1")])).unwrap();
-    // Declare 30000/1001 Hz (Table 6-4 code 4) in its sequence headers.
-    for i in 0..ntsc.len() - 7 {
-        if ntsc[i..i + 4] == [0, 0, 1, 0xB3] {
-            ntsc[i + 7] = (ntsc[i + 7] & 0xF0) | 4;
-        }
-    }
+    set_frame_rate_code(&mut ntsc, 4); // 30000/1001 Hz
     data.extend(ntsc);
     let decode = |base: TimeBase| {
         let mut dec = decoder();
@@ -287,6 +282,99 @@ fn an_unrepresentable_interpolated_time_is_an_error() {
     assert_eq!(first.pts, Some(i64::MAX - 10));
     // The next frame would start 3600 ticks later, past i64::MAX.
     assert!(matches!(dec.receive_frame(), Err(Error::InvalidData(_))));
+}
+
+/// Declare Table 6-4 `frame_rate_code` in every sequence header.
+fn set_frame_rate_code(stream: &mut [u8], code: u8) {
+    for i in 0..stream.len() - 7 {
+        if stream[i..i + 4] == [0, 0, 1, 0xB3] {
+            stream[i + 7] = (stream[i + 7] & 0xF0) | code;
+        }
+    }
+}
+
+/// FFmpeg's display-order `repeat_pict`: each frame lasts `2 + repeat_pict`
+/// fields.
+fn ffmpeg_fields(path: &Path) -> Vec<i64> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "frame=repeat_pict", "-of", "csv=p=0"])
+        .arg(path).output().expect("FFmpeg is required for the independent oracle");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap().lines()
+        .map(|line| 2 + line.trim().trim_end_matches(',').parse::<i64>().unwrap()).collect()
+}
+
+#[test]
+fn alternating_field_durations_keep_their_fractional_ticks() {
+    // 3:2 pulldown alternates three- and two-field frames. At 25 Hz a field
+    // is half a 1/25 tick; at 30000/1001 Hz it is 1501.5 ticks of 1/90000.
+    let pal = generated("pulldown25.m2v", 12, &[("interlaced", "true"), ("pulldown", "3:2"), ("b_between", "1")]);
+    let mut ntsc_bytes = std::fs::read(&pal).unwrap();
+    set_frame_rate_code(&mut ntsc_bytes, 4);
+    let ntsc = pal.with_file_name("pulldown2997.m2v");
+    std::fs::write(&ntsc, &ntsc_bytes).unwrap();
+    let (mut ours, mut expected) = (Vec::new(), Vec::new());
+    for (path, base, half_ticks_per_field) in
+        [(pal, TimeBase::new(1, 25), 1), (ntsc, TimeBase::new(1, 90_000), 3003)]
+    {
+        let mut fields = 0;
+        let times: Vec<_> = ffmpeg_fields(&path).iter().map(|f| {
+            let rounded = (fields * half_ticks_per_field + 1) / 2;
+            fields += f;
+            Some(rounded)
+        }).collect();
+        assert!(times.len() == 12 && times[2] != times[1]);
+        expected.push(times);
+        ours.push(decode_untimed(&std::fs::read(&path).unwrap(), base));
+    }
+    // Both cases at once: 25 Hz at 1/25, then 30000/1001 Hz at 1/90000.
+    assert_eq!(ours, expected);
+}
+
+#[test]
+fn a_rate_change_under_an_unreduced_time_base_stays_exact() {
+    // One tick is M/(M-1) seconds. 30 frames at 25 Hz, then 12 at 30 Hz.
+    let m = i64::MAX;
+    let mut data = std::fs::read(fixture("mpeg2-ibbp-96x64.m2v")).unwrap();
+    let mut thirty = std::fs::read(generated("thirty.m2v", 12, &[("b_between", "1")])).unwrap();
+    set_frame_rate_code(&mut thirty, 5);
+    data.extend(thirty);
+    // Elapsed seconds (6a + 5b)/150 times (M-1)/M ticks per second.
+    let big = m as u128;
+    let expected: Vec<_> = (0..30u128).map(|a| (a, 0)).chain((0..12u128).map(|b| (30, b)))
+        .map(|(a, b)| Some(((2 * (big - 1) * (6 * a + 5 * b) + 150 * big) / (300 * big)) as i64))
+        .collect();
+    assert_eq!(decode_untimed(&data, TimeBase::new(m, m - 1)), expected);
+}
+
+#[test]
+fn a_duration_beyond_i64_still_times_a_frame_that_fits() {
+    // 25/32 Hz: frame_rate_code 3 with frame_rate_extension_d = 31, so each
+    // frame lasts 32M/25 ticks of 1/M seconds.
+    let m = i64::MAX;
+    let mut data = std::fs::read(fixture("mpeg2-ibbp-96x64.m2v")).unwrap();
+    for i in 0..data.len() - 9 {
+        if data[i..i + 4] == [0, 0, 1, 0xB5] && data[i + 4] >> 4 == 1 {
+            data[i + 9] = (data[i + 9] & 0xE0) | 0x1F;
+            let parsed = oxideav_mpeg12video::sequence_extension::Mpeg2SequenceExtension::parse(&data[i..]);
+            assert_eq!(parsed.unwrap().frame_rate_extension_d, 31);
+        }
+    }
+    let mut packet = Packet::new(0, TimeBase::new(1, m), data);
+    packet.pts = Some(-m);
+    let mut dec = decoder();
+    dec.send_packet(&packet).unwrap();
+    dec.flush().unwrap();
+    let mut next_pts = || match dec.receive_frame() {
+        Ok(Frame::Video(frame)) => Ok(frame.pts),
+        Ok(_) => panic!("non-video output"),
+        Err(err) => Err(err),
+    };
+    assert_eq!(next_pts().unwrap(), Some(-m));
+    // -M + 32M/25 = 7M/25 fits even though the duration does not.
+    assert_eq!(next_pts().unwrap(), Some(2_582_544_170_319_337_226));
+    // The third frame, 39M/25 ticks in, does not.
+    assert!(matches!(next_pts(), Err(Error::InvalidData(_))));
 }
 
 fn ffmpeg_frames(path: &Path) -> Vec<u8> {

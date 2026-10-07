@@ -296,7 +296,9 @@ apply to later pictures, as in FFmpeg. A closed GOP's leading B-pictures
 predict only backward and decode, also in the strict whole-stream API. A
 frame coded as an I first field and a P second field decodes at startup or
 after reset when its second field predicts from the first; a prediction from
-the never-decoded older field is rejected.
+the never-decoded older field is rejected, including the implicit zero-motion
+prediction of a macroblock without motion vectors, which reads the field of
+its own parity.
 
 Timestamps follow ISO/IEC 13818-1 association: a packet's PTS/DTS belong to
 the first picture whose start code begins in it. The output chooses between
@@ -305,9 +307,11 @@ the picture's own PTS and the DTS that released it, as FFmpeg's
 still give increasing display times. Missing values continue exactly from the
 previous frame's §6.3.10 duration in the packet time base, including
 `repeat_first_field`. An untimed epoch starts at zero; no picture counter is
-mixed with container timestamps. Interpolation uses the time base in lowest
-terms with checked arithmetic; a frame that needs a time beyond `i64` ticks
-gets an `InvalidData` error. In a `low_delay` sequence, which has no
+mixed with container timestamps. Interpolation keeps exact fractions of a
+tick, summed over a common denominator, over the time base in lowest terms
+with checked arithmetic. A frame duration may exceed `i64` ticks; a frame
+whose time does not fit `i64` gets an `InvalidData` error. In a `low_delay`
+sequence, which has no
 B-pictures, each picture leaves as soon as it is decoded, at its own decode
 time, as in FFmpeg.
 
@@ -316,7 +320,8 @@ luma at 16 million pixels. Callers must drain after sending packets.
 Leading non-picture bytes retain only the three-byte start-code overlap.
 Slices cannot address macroblocks outside the picture grid, and a picture's
 slices stop at the first one that exceeds the grid, so slice work and
-retained macroblocks stay within twice the picture's macroblock count.
+retained macroblocks stay within twice the picture's macroblock count. MPEG-1
+D pictures, which have their own macroblock loop, are bounded the same way.
 `output_video_dimensions` reports visible sequence dimensions before first
 output and exactly the last returned frame thereafter; `output_pixel_format`
 follows the same rule. Packed output excludes macroblock padding. Unique
@@ -339,12 +344,17 @@ and pixel format, and 256 stateful mutation/reset recoveries.
 FFmpeg's complete output. `tests/presentation_timestamps.rs` checks sparse
 PES stamps through B reordering and open GOPs against bitstream-derived times,
 coded-order labels, and untimed field-pair, MPEG-1, 3:2-pulldown and
-progressive-repeat durations against FFmpeg; equal PTS for equivalent
-unreduced and reduced time bases across a frame-rate change; an error for an
-unrepresentable time; and low-delay output at each picture's own DTS.
-`tests/slice_bounds.rs` measures memory and allocation while rejecting
-out-of-grid and duplicate slices. `tests/field_startup.rs` decodes opening
-I/P field pairs against FFmpeg.
+progressive-repeat durations against FFmpeg; alternating three- and
+two-field durations at 25 Hz in 1/25 ticks and at 30000/1001 Hz in 1/90000
+ticks, keeping their fractional ticks; equal PTS for equivalent unreduced and
+reduced time bases across a frame-rate change, including a 25 → 30 Hz change
+under an (M, M-1) base; a duration longer than `i64` whose frame time fits;
+an error for an unrepresentable time; and low-delay output at each picture's
+own DTS. `tests/slice_bounds.rs` measures memory and allocation while
+rejecting out-of-grid and duplicate slices; a unit test counts MPEG-1 D-picture
+block decodes for the same cases. `tests/field_startup.rs` decodes opening I/P
+field pairs against FFmpeg in both field orders, including a P field
+macroblock without motion vectors.
 
 ## Encoder
 

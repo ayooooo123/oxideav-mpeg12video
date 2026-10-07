@@ -437,6 +437,12 @@ fn reconstruct_mpeg1_macroblock(
     Ok(1)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// D-picture block decodes on this thread, for the work-bound tests.
+    static D_BLOCK_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Decode a whole MPEG-1 **D** picture (dc intra-coded,
 /// `picture_coding_type == 4`, §2.4.3.4) into a [`FrameBuffer`].
 ///
@@ -468,6 +474,7 @@ pub fn decode_mpeg1_d_picture(
 
     let mut frame = FrameBuffer::new(params.width, params.height, ChromaFormat::Yuv420);
     let mb_width = params.mb_width();
+    let picture_macroblocks = mb_width * params.mb_height();
     let slice_ctx = SliceContext::non_scalable(params.height as u32);
 
     let mut placed = 0usize;
@@ -522,6 +529,13 @@ pub fn decode_mpeg1_d_picture(
                 address += 1;
             }
             is_first = false;
+            // §2.4.3.6: the address stays within the picture's grid; reject
+            // before any block of this macroblock is decoded.
+            if address >= picture_macroblocks {
+                return Err(Error::InvalidBitstream(
+                    "macroblock_address: beyond the picture's macroblock grid (§2.4.3.6)",
+                ));
+            }
 
             // Table B.2d: the single macroblock_type codeword '1'.
             let mb_type_bit = br.read_bit().map_err(|_| crate::Error::ShortHeader)?;
@@ -536,6 +550,8 @@ pub fn decode_mpeg1_d_picture(
             let mb_col = address % mb_width;
             let mb_row_now = address / mb_width;
             for i in 0..6u8 {
+                #[cfg(test)]
+                D_BLOCK_DECODES.with(|count| count.set(count.get() + 1));
                 let block = crate::mpeg1_block_decoder::decode_d_block(
                     &mut br,
                     i,
@@ -562,6 +578,7 @@ pub fn decode_mpeg1_d_picture(
             }
             placed += 1;
         }
+        check_slice_coverage(placed, picture_macroblocks)?;
         offset = start + end;
     }
     Ok((frame, placed))
@@ -579,4 +596,59 @@ fn find_slice_start_code(buf: &[u8]) -> Option<usize> {
 fn find_next_start_code(buf: &[u8]) -> Option<usize> {
     buf.windows(3)
         .position(|w| w[0] == 0x00 && w[1] == 0x00 && w[2] == 0x01)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxideav_core::bits::BitWriter;
+
+    /// A 16×16 D picture (one macroblock) whose slices all start at row 0
+    /// with the given macroblock counts; each macroblock is DC-only.
+    fn d_picture(slices: &[usize]) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        crate::stream_writer::write_picture_header(&mut bw, 0, PictureCodingType::DcIntra, 0, 0);
+        for &count in slices {
+            crate::stream_writer::write_slice_header(&mut bw, 0, 8);
+            for _ in 0..count {
+                bw.write_bit(true); // macroblock_address_increment = 1
+                bw.write_bit(true); // Table B.2d macroblock_type
+                for _ in 0..4 {
+                    bw.write_u32(0b100, 3); // luminance DC size 0
+                }
+                for _ in 0..2 {
+                    bw.write_u32(0b00, 2); // chrominance DC size 0
+                }
+                bw.write_bit(true); // end_of_macroblock
+            }
+            bw.align_to_byte_zero();
+        }
+        let mut picture = bw.finish();
+        picture.extend_from_slice(&[0, 0, 1, 0xB7]);
+        picture
+    }
+
+    /// Whether the picture decodes, and how many blocks were decoded.
+    fn block_decodes(slices: &[usize]) -> (bool, usize) {
+        let params = Mpeg1PictureParams {
+            width: 16,
+            height: 16,
+            intra_quant: crate::dequantize::DEFAULT_INTRA_QUANT,
+            non_intra_quant: [[16; 8]; 8],
+        };
+        D_BLOCK_DECODES.with(|count| count.set(0));
+        let decoded = decode_mpeg1_d_picture(&d_picture(slices), &params).is_ok();
+        (decoded, D_BLOCK_DECODES.with(|count| count.get()))
+    }
+
+    #[test]
+    fn d_picture_work_stays_within_the_macroblock_grid() {
+        assert_eq!(block_decodes(&[1]), (true, 6));
+        // One slice of 100,000 macroblocks: rejected at the second.
+        let (decoded, calls) = block_decodes(&[100_000]);
+        assert!(!decoded && calls <= 6, "overlong slice: {calls} block decodes");
+        // 100,000 one-macroblock slices: rejected at the second slice.
+        let (decoded, calls) = block_decodes(&vec![1; 100_000]);
+        assert!(!decoded && calls <= 12, "duplicate slices: {calls} block decodes");
+    }
 }

@@ -923,7 +923,13 @@ fn reconstruct_one_field_macroblock(
 
     match prediction_type {
         PredictionType::FieldBased => {
-            let motion = field_picture_motion_from_reconstructed(record, reconstructed);
+            let mut motion = field_picture_motion_from_reconstructed(record, reconstructed);
+            // §7.6.3.5: a P-field macroblock without motion vectors ("No MC")
+            // predicts with a zero vector from the field of its own parity.
+            // Resolve it here so the reference check sees that field.
+            if motion.forward.is_none() && motion.backward.is_none() {
+                motion.forward = Some((MotionVectorPel::new(0, 0), predicted_parity));
+            }
             if let Some((_, parity)) = motion.forward {
                 require_reference_field(parity, missing_forward_field)?;
             }

@@ -30,14 +30,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   B-pictures decode backward-only in both APIs.
 - Bound slice work: the walker rejects macroblock addresses outside the
   picture grid before parsing or decoding them, and picture drivers stop at the
-  first slice that covers more macroblocks than the grid holds.
-- Interpolate presentation times exactly in the reduced time base with checked
-  arithmetic; an unrepresentable time is an `InvalidData` error, not an
-  overflow panic or wrapped value.
+  first slice that covers more macroblocks than the grid holds. MPEG-1 D
+  pictures apply the same bound before decoding any block.
+- Interpolate presentation times as exact fractions of a tick, summed over a
+  common denominator in the reduced time base, with checked arithmetic. A
+  duration may exceed `i64`; only a time that does not fit `i64` is an
+  `InvalidData` error, never an overflow panic, wrapped value or lost fraction.
 - Keep `low_delay` from the sequence extension: such pictures are output as
   decoded, at their own decode time, as in FFmpeg.
 - Decode an opening I-field + P-field pair at startup or after reset when the
-  P field predicts from the first field; reject predictions from missing fields.
+  P field predicts from the first field; reject predictions from missing
+  fields, including the implicit zero-motion prediction of "No MC" macroblocks.
 - Encoder conformance applies frame-count, source-fidelity, slice-structure and
   Annex C checks to newly encoded streams, not only to committed fixtures.
 

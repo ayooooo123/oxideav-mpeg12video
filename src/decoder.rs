@@ -116,34 +116,43 @@ enum Next {
     #[default]
     Unknown,
     At(Ticks),
-    /// The previous frame ends beyond the `i64` tick range.
+    /// The previous frame ends beyond the exact tick range.
     Unrepresentable,
 }
 
-/// An exact time of `whole + rem / den` ticks, `rem < den`.
+/// An exact time of `whole + rem / den` ticks in lowest terms, `rem < den`.
+/// The whole part is wider than `i64`, so a long duration still adds
+/// exactly; only a presented time must fit `i64`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Ticks {
-    whole: i64,
+    whole: i128,
     rem: u128,
     den: u128,
 }
 
 impl Ticks {
+    fn at(ticks: i64) -> Self {
+        Self { whole: i128::from(ticks), rem: 0, den: 1 }
+    }
+
+    /// The exact sum over the common denominator, in lowest terms.
     fn plus(self, step: Ticks) -> Option<Ticks> {
-        // A frame-rate change moves the fraction to the new denominator.
-        let rem = if self.den == step.den { self.rem } else { self.rem.checked_mul(step.den)? / self.den };
-        let rem = rem + step.rem;
-        let carry = rem >= step.den;
+        let g = gcd(self.den, step.den);
+        let den = (self.den / g).checked_mul(step.den)?;
+        let rem = self.rem.checked_mul(step.den / g)?.checked_add(step.rem.checked_mul(self.den / g)?)?;
+        let carry = rem >= den;
+        let rem = if carry { rem - den } else { rem };
+        let g = gcd(rem, den);
         Some(Ticks {
-            whole: self.whole.checked_add(step.whole)?.checked_add(i64::from(carry))?,
-            rem: if carry { rem - step.den } else { rem },
-            den: step.den,
+            whole: self.whole.checked_add(step.whole)?.checked_add(i128::from(carry))?,
+            rem: rem / g,
+            den: den / g,
         })
     }
 
-    /// The nearest tick; halves round up.
+    /// The nearest tick, halves rounding up, when it fits `i64`.
     fn rounded(self) -> Option<i64> {
-        self.whole.checked_add(i64::from(2 * self.rem >= self.den))
+        i64::try_from(self.whole.checked_add(i128::from(2 * self.rem >= self.den))?).ok()
     }
 }
 
@@ -154,9 +163,9 @@ fn gcd(mut a: u128, mut b: u128) -> u128 {
     a
 }
 
-/// A duration of `num / den` seconds in ticks of `seconds_per_tick`, or
-/// `None` when its whole part does not fit `i64`. Both factors are at most
-/// 2^63, so the products fit `u128`.
+/// A duration of `num / den` seconds in ticks of `seconds_per_tick`. The
+/// factors are below 2^64 and 2^63, so the products fit `u128` and the whole
+/// part fits `i128`.
 fn duration_ticks((num, den): (u64, u64), (tick_num, tick_den): (u128, u128)) -> Option<Ticks> {
     let (n, d) = (u128::from(num) * tick_den, u128::from(den) * tick_num);
     let g = gcd(n, d);
@@ -164,7 +173,7 @@ fn duration_ticks((num, den): (u64, u64), (tick_num, tick_den): (u128, u128)) ->
         return None;
     }
     let (n, d) = (n / g, d / g);
-    Some(Ticks { whole: i64::try_from(n / d).ok()?, rem: n % d, den: d })
+    Some(Ticks { whole: i128::try_from(n / d).ok()?, rem: n % d, den: d })
 }
 
 impl PresentationClock {
@@ -215,7 +224,7 @@ impl PresentationClock {
                 // Continue an interpolated run exactly, not from its rounding.
                 let start = match self.next {
                     Next::At(end) if expected == Some(at) => end,
-                    _ => Ticks { whole: at, rem: 0, den: 1 },
+                    _ => Ticks::at(at),
                 };
                 match duration_ticks(duration, tick).and_then(|step| start.plus(step)) {
                     Some(end) => Next::At(end),

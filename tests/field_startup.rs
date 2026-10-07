@@ -5,13 +5,19 @@
 //! bytes as the reference.
 use oxideav_core::bits::BitWriter;
 use oxideav_core::{CodecId, Decoder, Error, Frame, Packet, TimeBase};
+use oxideav_mpeg12video::coded_block_pattern::encode_coded_block_pattern;
 use oxideav_mpeg12video::field_picture_encoder::{
     encode_field_intra_picture, encode_field_p_picture, second_p_field_reference,
 };
-use oxideav_mpeg12video::picture_header::PictureStructure;
+use oxideav_mpeg12video::mpeg2_dct_coeff::{
+    encode_dct_coeff, encode_end_of_block, CoefficientPosition, TableSelection,
+};
+use oxideav_mpeg12video::picture_header::{PictureCodingType, PictureStructure};
 use oxideav_mpeg12video::sequence_extension::ChromaFormat;
 use oxideav_mpeg12video::stream_writer::{
-    write_sequence_extension, write_sequence_header, SequenceHeaderParams,
+    write_field_picture_coding_extension, write_picture_header, write_sequence_extension,
+    write_sequence_header, write_slice_header_in, PictureCodingExtensionParams,
+    SequenceHeaderParams,
 };
 use oxideav_mpeg12video::{
     assemble_frame_from_fields, write_gop_header, FrameBuffer, IntraPictureParams, Mpeg12Decoder,
@@ -170,12 +176,71 @@ fn a_second_field_reading_a_missing_older_field_is_rejected() {
     assert_eq!(frames.concat(), ffmpeg("previous.m2v", &both));
     assert_eq!(frames.len(), 2);
     assert_eq!(field_rows(&frames[1], 1), field_rows(&frames[0], 1));
-    // Without frame 0 that field was never decoded: reject, from startup
-    // and after reset, and recover for valid input afterwards.
+    // Without frame 0 that field was never decoded. The per-macroblock
+    // field-availability guard rejects it, from startup and after reset; a
+    // blanket rejection of opening P fields would fail here.
     for _ in 0..2 {
         dec.reset().unwrap();
-        assert!(matches!(decode(&mut dec, &alone), Err(Error::InvalidData(_))));
+        match decode(&mut dec, &alone) {
+            Err(Error::InvalidData(message)) => assert!(message.contains("never decoded"), "{message}"),
+            other => panic!("prediction from a missing field accepted: {other:?}"),
+        }
     }
     dec.reset().unwrap();
     assert_eq!(decode(&mut dec, &startup_pair()).unwrap().len(), 1);
+}
+
+/// A P field whose one macroblock is Table B-3 `01`, "No MC, Coded": zero
+/// motion from the reference field of its own parity (§7.6.3.5), plus one
+/// coded luminance block.
+fn uncompensated_p_field(bw: &mut BitWriter, structure: PictureStructure, temporal_reference: u16) {
+    write_picture_header(bw, temporal_reference, PictureCodingType::Predictive, 7, 7);
+    let ext = PictureCodingExtensionParams { forward_f_code: 1, ..Default::default() };
+    write_field_picture_coding_extension(bw, &ext, structure);
+    write_slice_header_in(bw, 0, 8, 32);
+    bw.write_bit(true); // macroblock_address_increment = 1
+    bw.write_u32(0b01, 2); // macroblock_type: No MC, Coded
+    encode_coded_block_pattern(bw, &[true, false, false, false, false, false], ChromaFormat::Yuv420).unwrap();
+    encode_dct_coeff(bw, TableSelection::TableZero, CoefficientPosition::First, 0, 4);
+    encode_end_of_block(bw, TableSelection::TableZero);
+    bw.align_to_byte_zero();
+}
+
+/// An intra `first` field and an uncompensated P second field, opening the
+/// stream or after an intra frame with distinct fields.
+fn uncompensated_pair(first: PictureStructure, after_previous: bool) -> Vec<u8> {
+    let mut bw = headers();
+    let mut temporal_reference = 0;
+    if after_previous {
+        encode_field_intra_picture(&mut bw, &field(5), &field_params(), PictureStructure::TopField, 0, 4).unwrap();
+        encode_field_intra_picture(&mut bw, &field(6), &field_params(), PictureStructure::BottomField, 0, 4).unwrap();
+        temporal_reference = 1;
+    }
+    let second = match first {
+        PictureStructure::TopField => PictureStructure::BottomField,
+        _ => PictureStructure::TopField,
+    };
+    encode_field_intra_picture(&mut bw, &field(7), &field_params(), first, temporal_reference, 4).unwrap();
+    uncompensated_p_field(&mut bw, second, temporal_reference);
+    finish(bw)
+}
+
+#[test]
+fn an_uncompensated_p_field_macroblock_reads_its_own_parity() {
+    for first in [PictureStructure::TopField, PictureStructure::BottomField] {
+        let mut dec = Mpeg12Decoder::new(CodecId::new("mpeg2video"));
+        // Opening the stream, from startup and after reset: the older field
+        // of the second field's parity was never decoded.
+        for _ in 0..2 {
+            let result = decode(&mut dec, &uncompensated_pair(first, false));
+            assert!(matches!(result, Err(Error::InvalidData(_))), "{first:?}: {result:?}");
+            dec.reset().unwrap();
+        }
+        // After a decoded frame with distinct fields, that field is the
+        // reference.
+        let stream = uncompensated_pair(first, true);
+        let frames = decode(&mut dec, &stream).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames.concat(), ffmpeg(&format!("uncompensated-{first:?}.m2v"), &stream), "{first:?}");
+    }
 }

@@ -169,6 +169,7 @@ pub fn decode_inter_picture_with_matrices(
     let geom = params.geometry;
     let mut frame = geom.new_frame_buffer();
     let mb_width = geom.mb_width() as u32;
+    let picture_macroblocks = geom.mb_width() * geom.mb_height();
     let slice_ctx = SliceContext::non_scalable(geom.height as u32);
 
     let mut placed = 0usize;
@@ -209,7 +210,8 @@ pub fn decode_inter_picture_with_matrices(
             geom.intra_dc_precision,
             geom.q_scale_type,
         )
-        .with_quantiser_matrices(*matrices);
+        .with_quantiser_matrices(*matrices)
+        .with_picture_macroblocks(picture_macroblocks);
 
         let walk = walk_slice_at(slice_buf, header.body_bit_position, ctx)?;
         let motion = reconstruct_slice_motion_vectors(&walk, &ctx)?;
@@ -247,6 +249,7 @@ pub fn decode_inter_picture_with_matrices(
                 &mut previous_inter_direction,
             )?;
         }
+        crate::slice_macroblock_walk::check_slice_coverage(placed, picture_macroblocks)?;
 
         offset = next_slice_offset;
     }
@@ -753,12 +756,28 @@ pub fn decode_field_picture_with_matrices(
     references: ReferenceFrames<'_>,
     matrices: &crate::quant_matrix_extension::QuantiserMatrixState,
 ) -> Result<(FrameBuffer, usize)> {
+    decode_field_picture_from(picture, params, structure, references, matrices, None)
+}
+
+/// [`decode_field_picture_with_matrices`] when one field of the forward
+/// reference frame was never decoded: a P second field at startup or after
+/// reset has only its frame's first field (§7.6.2.1). A prediction from
+/// `missing_forward_field` is rejected; the other field remains usable.
+pub(crate) fn decode_field_picture_from(
+    picture: &[u8],
+    params: PicturePredictionParams,
+    structure: PictureStructure,
+    references: ReferenceFrames<'_>,
+    matrices: &crate::quant_matrix_extension::QuantiserMatrixState,
+    missing_forward_field: Option<FieldParity>,
+) -> Result<(FrameBuffer, usize)> {
     use crate::slice_header::{SliceContext, SliceHeader};
 
     let geom = params.geometry;
     // The destination is one field: a field-height frame buffer.
     let mut field = geom.new_frame_buffer();
     let mb_width = geom.mb_width() as u32;
+    let picture_macroblocks = geom.mb_width() * geom.mb_height();
     // The slice_vertical_position spans the *field* height, but §6.2.4
     // gates slice_vertical_position_extension on the sequence
     // vertical_size (the frame height); `geom` is the field geometry.
@@ -797,7 +816,8 @@ pub fn decode_field_picture_with_matrices(
             geom.intra_dc_precision,
             geom.q_scale_type,
         )
-        .with_quantiser_matrices(*matrices);
+        .with_quantiser_matrices(*matrices)
+        .with_picture_macroblocks(picture_macroblocks);
 
         let walk = walk_slice_at(slice_buf, header.body_bit_position, ctx)?;
         let motion = reconstruct_slice_motion_vectors(&walk, &ctx)?;
@@ -826,6 +846,7 @@ pub fn decode_field_picture_with_matrices(
                     params.picture_coding_type,
                     selected_parity,
                     previous_field_motion,
+                    missing_forward_field,
                 )?;
             }
 
@@ -838,8 +859,10 @@ pub fn decode_field_picture_with_matrices(
                 geom.chroma_format,
                 selected_parity,
                 &mut previous_field_motion,
+                missing_forward_field,
             )?;
         }
+        crate::slice_macroblock_walk::check_slice_coverage(placed, picture_macroblocks)?;
 
         offset = next_slice_offset;
     }
@@ -852,8 +875,8 @@ pub fn decode_field_picture_with_matrices(
 /// [`reconstruct_field_picture_macroblock`].
 // Mirrors `reconstruct_one_macroblock`: every argument (dest, references,
 // wire + reconstructed records, geometry, the predicted-field parity for
-// dual-prime, and the carried B-field-skip direction) is required by the
-// §7.6 field-picture path.
+// dual-prime, the carried B-field-skip direction and the reference field
+// that was never decoded) is required by the §7.6 field-picture path.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_one_field_macroblock(
     field: &mut FrameBuffer,
@@ -864,6 +887,7 @@ fn reconstruct_one_field_macroblock(
     chroma_format: crate::sequence_extension::ChromaFormat,
     predicted_parity: FieldParity,
     previous_field_motion: &mut Option<FieldPictureMotion>,
+    missing_forward_field: Option<FieldParity>,
 ) -> Result<usize> {
     if record.macroblock_type.macroblock_intra {
         place_intra_macroblock(field, record, mb_width, chroma_format);
@@ -900,6 +924,9 @@ fn reconstruct_one_field_macroblock(
     match prediction_type {
         PredictionType::FieldBased => {
             let motion = field_picture_motion_from_reconstructed(record, reconstructed);
+            if let Some((_, parity)) = motion.forward {
+                require_reference_field(parity, missing_forward_field)?;
+            }
             reconstruct_field_picture_macroblock(
                 field, references, mb_col, mb_row, motion, &residuals,
             )
@@ -911,6 +938,9 @@ fn reconstruct_one_field_macroblock(
         }
         PredictionType::SixteenByEight => {
             let motion = field_picture_16x8_motion_from_reconstructed(record, reconstructed);
+            for (_, parity) in motion.forward.into_iter().flatten() {
+                require_reference_field(parity, missing_forward_field)?;
+            }
             reconstruct_field_picture_16x8_macroblock(
                 field, references, mb_col, mb_row, motion, &residuals,
             )
@@ -927,7 +957,10 @@ fn reconstruct_one_field_macroblock(
         PredictionType::DualPrime => {
             // §7.6.2 / Table 7-13 `Dual prime`: forward-only P-field
             // same-/opposite-parity reconstruction from the single
-            // reference frame.
+            // reference frame, reading both of its fields.
+            for parity in [FieldParity::Top, FieldParity::Bottom] {
+                require_reference_field(parity, missing_forward_field)?;
+            }
             let dp_motion = field_picture_dual_prime_motion_from_reconstructed(
                 record,
                 reconstructed,
@@ -954,6 +987,17 @@ fn reconstruct_one_field_macroblock(
     Ok(1)
 }
 
+/// §7.6.2.1: reject a prediction from a reference field that was never
+/// decoded.
+fn require_reference_field(parity: FieldParity, missing: Option<FieldParity>) -> Result<()> {
+    if missing == Some(parity) {
+        return Err(crate::Error::InvalidBitstream(
+            "§7.6.2.1: prediction from a reference field that was never decoded",
+        ));
+    }
+    Ok(())
+}
+
 /// Reconstruct one §7.6.6 skipped macroblock of a field picture.
 ///
 /// * **P-field (§7.6.6.1)** — prediction as Field-based with a `(0, 0)`
@@ -968,6 +1012,9 @@ fn reconstruct_one_field_macroblock(
 ///   reference field each direction reads is forced to `selected_parity`
 ///   per the §7.6.6.3 same-parity rule (overriding the previous coded
 ///   macroblock's own field-select bit).
+// Every argument is §7.6.6 skip state; `missing_forward_field` is the
+// reference field that was never decoded.
+#[allow(clippy::too_many_arguments)]
 fn reconstruct_skipped_field_macroblock(
     field: &mut FrameBuffer,
     references: ReferenceFrames<'_>,
@@ -976,6 +1023,7 @@ fn reconstruct_skipped_field_macroblock(
     picture_coding_type: PictureCodingType,
     selected_parity: FieldParity,
     previous_field_motion: Option<FieldPictureMotion>,
+    missing_forward_field: Option<FieldParity>,
 ) -> Result<usize> {
     let mb_col = address % mb_width;
     let mb_row = address / mb_width;
@@ -998,6 +1046,9 @@ fn reconstruct_skipped_field_macroblock(
         // §7.6.6.1 P-field skip: zero MV, same-parity field.
         _ => FieldPictureMotion::forward(MotionVectorPel::new(0, 0), selected_parity),
     };
+    if let Some((_, parity)) = motion.forward {
+        require_reference_field(parity, missing_forward_field)?;
+    }
     reconstruct_field_picture_macroblock(field, references, mb_col, mb_row, motion, &[])
         .map_err(crate::Error::from)?;
     Ok(1)

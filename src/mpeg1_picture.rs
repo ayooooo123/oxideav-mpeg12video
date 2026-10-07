@@ -47,7 +47,9 @@ use crate::picture_header::{PictureCodingType, PictureStructure};
 use crate::quant_matrix_extension::QuantiserMatrixState;
 use crate::sequence_extension::ChromaFormat;
 use crate::slice_header::{SliceContext, SliceHeader};
-use crate::slice_macroblock_walk::{walk_slice_at, MacroblockRecord, SliceWalkContext};
+use crate::slice_macroblock_walk::{
+    check_slice_coverage, walk_slice_at, MacroblockRecord, SliceWalkContext,
+};
 use crate::{Error, Result};
 
 /// The per-picture parameters shared by every MPEG-1 picture type:
@@ -72,6 +74,11 @@ impl Mpeg1PictureParams {
     /// Macroblocks per row (`Ceil(width / 16)`).
     pub fn mb_width(&self) -> usize {
         self.width.div_ceil(16)
+    }
+
+    /// Macroblock rows (`Ceil(height / 16)`).
+    pub fn mb_height(&self) -> usize {
+        self.height.div_ceil(16)
     }
 }
 
@@ -125,7 +132,7 @@ fn mpeg1_walk_context(
         intra_chroma: params.intra_quant,
         non_intra_chroma: params.non_intra_quant,
     };
-    ctx
+    ctx.with_picture_macroblocks(params.mb_width() * params.mb_height())
 }
 
 /// Decode a whole MPEG-1 **I** picture into a [`FrameBuffer`].
@@ -171,6 +178,7 @@ pub fn decode_mpeg1_intra_picture(
                 place_intra_macroblock(&mut frame, record, mb_width, ChromaFormat::Yuv420) > 0,
             );
         }
+        check_slice_coverage(placed, params.mb_width() * params.mb_height())?;
         offset = start + end;
     }
     Ok((frame, placed))
@@ -295,6 +303,7 @@ pub fn decode_mpeg1_inter_picture(
                 &mut prior,
             )?;
         }
+        check_slice_coverage(placed, params.base.mb_width() * params.base.mb_height())?;
         offset = start + end;
     }
     Ok((frame, placed))

@@ -596,7 +596,8 @@ fn reconstruct_refined_picture(
             geometry.intra_dc_precision,
             geometry.q_scale_type,
         )
-        .with_quantiser_matrices(*matrices);
+        .with_quantiser_matrices(*matrices)
+        .with_picture_macroblocks(mb_width as usize * mb_height);
         let walk = walk_slice_at(slice_buf, sh.body_bit_position, ctx)?;
         let motion = if intra_picture {
             None
@@ -722,6 +723,7 @@ fn reconstruct_refined_picture(
             layer.end_macroblock(address, field_dct)?;
         }
         layer.end_slice()?;
+        crate::slice_macroblock_walk::check_slice_coverage(placed, mb_width as usize * mb_height)?;
     }
     if placed != mb_width as usize * mb_height {
         return Err(Error::InvalidBitstream(

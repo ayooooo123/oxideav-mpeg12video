@@ -293,7 +293,10 @@ adapter discards pictures before the first sequence header, P/B pictures
 before any anchor, and open-GOP leading B-pictures without a forward
 reference. A discarded picture's §6.3.11 quantiser-matrix downloads still
 apply to later pictures, as in FFmpeg. A closed GOP's leading B-pictures
-predict only backward and decode, also in the strict whole-stream API.
+predict only backward and decode, also in the strict whole-stream API. A
+frame coded as an I first field and a P second field decodes at startup or
+after reset when its second field predicts from the first; a prediction from
+the never-decoded older field is rejected.
 
 Timestamps follow ISO/IEC 13818-1 association: a packet's PTS/DTS belong to
 the first picture whose start code begins in it. The output chooses between
@@ -302,11 +305,18 @@ the picture's own PTS and the DTS that released it, as FFmpeg's
 still give increasing display times. Missing values continue exactly from the
 previous frame's §6.3.10 duration in the packet time base, including
 `repeat_first_field`. An untimed epoch starts at zero; no picture counter is
-mixed with container timestamps.
+mixed with container timestamps. Interpolation uses the time base in lowest
+terms with checked arithmetic; a frame that needs a time beyond `i64` ticks
+gets an `InvalidData` error. In a `low_delay` sequence, which has no
+B-pictures, each picture leaves as soon as it is decoded, at its own decode
+time, as in FFmpeg.
 
 Compressed input is capped at 32 MiB, timestamp markers at 4096, and padded
 luma at 16 million pixels. Callers must drain after sending packets.
 Leading non-picture bytes retain only the three-byte start-code overlap.
+Slices cannot address macroblocks outside the picture grid, and a picture's
+slices stop at the first one that exceeds the grid, so slice work and
+retained macroblocks stay within twice the picture's macroblock count.
 `output_video_dimensions` reports visible sequence dimensions before first
 output and exactly the last returned frame thereafter; `output_pixel_format`
 follows the same rule. Packed output excludes macroblock padding. Unique
@@ -329,7 +339,12 @@ and pixel format, and 256 stateful mutation/reset recoveries.
 FFmpeg's complete output. `tests/presentation_timestamps.rs` checks sparse
 PES stamps through B reordering and open GOPs against bitstream-derived times,
 coded-order labels, and untimed field-pair, MPEG-1, 3:2-pulldown and
-progressive-repeat durations against FFmpeg.
+progressive-repeat durations against FFmpeg; equal PTS for equivalent
+unreduced and reduced time bases across a frame-rate change; an error for an
+unrepresentable time; and low-delay output at each picture's own DTS.
+`tests/slice_bounds.rs` measures memory and allocation while rejecting
+out-of-grid and duplicate slices. `tests/field_startup.rs` decodes opening
+I/P field pairs against FFmpeg.
 
 ## Encoder
 
@@ -569,9 +584,11 @@ mode flags packets while decoding all frames — the same documented
 behaviour as the `fieldpics` conformance fixture) with its committed
 reference decode agreeing with ours at max |Δ| 2 (pure Annex A IDCT
 rounding).
-`tests/selfenc_conformance.rs` now checks every newly generated supported
-stream's complete decoded output against FFmpeg `-idct simple`, with exact
-pixel bytes and frame counts, rather than pinning incidental encoder bytes.
+`tests/selfenc_conformance.rs` checks every newly generated supported stream
+for the requested frame count, the luma source-fidelity bound, its slice
+structure and Annex C conformance where relevant, and FFmpeg `-idct simple`
+decoding of the same bytes to identical pixels, rather than pinning incidental
+encoder bytes. A one-frame or flat-pixel encoder mutation fails these checks.
 The committed legacy fixtures and their original reference checks remain;
 scalable enhancement streams retain their reconstruction checks because the
 independent decoder does not support those profiles. This coverage originally

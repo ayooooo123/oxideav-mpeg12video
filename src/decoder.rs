@@ -58,9 +58,10 @@ impl Decoder for Mpeg12Decoder {
             return Err(if self.stream.is_drained() { Error::Eof } else { Error::NeedMore });
         };
         let picture = &released.picture;
+        let pts = self.clock.present(picture.stamp.pts, released.release_dts, picture.duration)
+            .map_err(|Unrepresentable| Error::invalid("mpeg12video: presentation time does not fit i64 ticks"))?;
         let frame = &picture.decoded.frame;
         self.last_output = Some((frame.width as u32, frame.height as u32, pixel_format(frame.chroma_format)));
-        let pts = self.clock.present(picture.stamp.pts, released.release_dts, picture.duration);
         let mut vf = match std::sync::Arc::try_unwrap(released.picture) {
             Ok(output) => owned_frame_buffer_to_video_frame(output.decoded.frame),
             Err(output) => frame_buffer_to_video_frame(&output.decoded.frame),
@@ -90,29 +91,104 @@ impl Decoder for Mpeg12Decoder {
 /// values have been non-increasing more often than DTS values, as when a
 /// demuxer labels coded-order times as PTS. Missing times continue exactly
 /// from the previous frame's §6.3.10 duration; an untimed epoch starts at 0.
-/// No picture index is mixed with container timestamps.
+/// No picture index is mixed with container timestamps. Interpolation uses
+/// the time base in lowest terms with checked arithmetic; a frame needing a
+/// time that does not fit `i64` ticks gets `Unrepresentable`.
 #[derive(Debug, Default)]
 struct PresentationClock {
     time_base: Option<TimeBase>,
+    /// `time_base` in lowest terms, when positive.
+    seconds_per_tick: Option<(u128, u128)>,
     last_pts: Option<i64>,
     last_dts: Option<i64>,
     faulty_pts: u64,
     faulty_dts: u64,
-    /// End of the previous frame in ticks, exactly `numerator / denominator`.
-    next: Option<(i128, i128)>,
+    /// When the previous frame ends.
+    next: Next,
     started: bool,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Unrepresentable;
+
+#[derive(Debug, Default, Clone, Copy)]
+enum Next {
+    #[default]
+    Unknown,
+    At(Ticks),
+    /// The previous frame ends beyond the `i64` tick range.
+    Unrepresentable,
+}
+
+/// An exact time of `whole + rem / den` ticks, `rem < den`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ticks {
+    whole: i64,
+    rem: u128,
+    den: u128,
+}
+
+impl Ticks {
+    fn plus(self, step: Ticks) -> Option<Ticks> {
+        // A frame-rate change moves the fraction to the new denominator.
+        let rem = if self.den == step.den { self.rem } else { self.rem.checked_mul(step.den)? / self.den };
+        let rem = rem + step.rem;
+        let carry = rem >= step.den;
+        Some(Ticks {
+            whole: self.whole.checked_add(step.whole)?.checked_add(i64::from(carry))?,
+            rem: if carry { rem - step.den } else { rem },
+            den: step.den,
+        })
+    }
+
+    /// The nearest tick; halves round up.
+    fn rounded(self) -> Option<i64> {
+        self.whole.checked_add(i64::from(2 * self.rem >= self.den))
+    }
+}
+
+fn gcd(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// A duration of `num / den` seconds in ticks of `seconds_per_tick`, or
+/// `None` when its whole part does not fit `i64`. Both factors are at most
+/// 2^63, so the products fit `u128`.
+fn duration_ticks((num, den): (u64, u64), (tick_num, tick_den): (u128, u128)) -> Option<Ticks> {
+    let (n, d) = (u128::from(num) * tick_den, u128::from(den) * tick_num);
+    let g = gcd(n, d);
+    if g == 0 || d == 0 {
+        return None;
+    }
+    let (n, d) = (n / g, d / g);
+    Some(Ticks { whole: i64::try_from(n / d).ok()?, rem: n % d, den: d })
+}
+
 impl PresentationClock {
     fn set_time_base(&mut self, time_base: TimeBase) {
         if self.time_base != Some(time_base) {
             // An expectation in another unit cannot be carried over.
-            self.next = None;
+            self.next = Next::Unknown;
             self.time_base = Some(time_base);
+            let base = time_base.as_rational();
+            self.seconds_per_tick = (base.num > 0 && base.den > 0).then(|| {
+                let (num, den) = (base.num as u128, base.den as u128);
+                let g = gcd(num, den);
+                (num / g, den / g)
+            });
         }
     }
 
-    fn present(&mut self, pts: Option<i64>, release_dts: Option<i64>, duration: Option<(u64, u64)>) -> Option<i64> {
-        let expected = self.next.and_then(|(n, d)| round_div(n, d));
+    fn present(&mut self, pts: Option<i64>, release_dts: Option<i64>, duration: Option<(u64, u64)>)
+        -> std::result::Result<Option<i64>, Unrepresentable> {
+        let (expected, overflowed) = match self.next {
+            Next::At(end) => (end.rounded(), end.rounded().is_none()),
+            Next::Unknown => (None, false),
+            Next::Unrepresentable => (None, true),
+        };
         // A frame released without a decode time (end of input) follows the
         // previous one.
         let dts = release_dts.or(expected);
@@ -130,27 +206,28 @@ impl PresentationClock {
         }
         let chosen = if pts.is_some() && (self.faulty_pts <= self.faulty_dts || dts.is_none()) { pts } else { dts };
         let chosen = chosen.or((!self.started).then_some(0));
+        if chosen.is_none() && overflowed {
+            return Err(Unrepresentable);
+        }
         self.started = true;
-        let step = duration.zip(self.time_base).and_then(|((num, den), base)| {
-            let base = base.as_rational();
-            (base.num > 0 && base.den > 0 && den > 0)
-                .then(|| (i128::from(num) * i128::from(base.den), i128::from(den) * i128::from(base.num)))
-        });
-        self.next = match (chosen, step) {
-            (Some(at), Some((num, den))) => Some(match self.next {
+        self.next = match (chosen, duration, self.seconds_per_tick) {
+            (Some(at), Some(duration), Some(tick)) => {
                 // Continue an interpolated run exactly, not from its rounding.
-                Some((n, d)) if expected == Some(at) => ((if d == den { n } else { n * den / d }) + num, den),
-                _ => (i128::from(at) * den + num, den),
-            }),
-            _ => None,
+                let start = match self.next {
+                    Next::At(end) if expected == Some(at) => end,
+                    _ => Ticks { whole: at, rem: 0, den: 1 },
+                };
+                match duration_ticks(duration, tick).and_then(|step| start.plus(step)) {
+                    Some(end) => Next::At(end),
+                    None => Next::Unrepresentable,
+                }
+            }
+            _ => Next::Unknown,
         };
-        chosen
+        Ok(chosen)
     }
 }
 
-fn round_div(numerator: i128, denominator: i128) -> Option<i64> {
-    i64::try_from((2 * numerator + denominator).div_euclid(2 * denominator)).ok()
-}
 fn pixel_format(chroma: ChromaFormat) -> PixelFormat {
     match chroma { ChromaFormat::Yuv420 => PixelFormat::Yuv420P, ChromaFormat::Yuv422 => PixelFormat::Yuv422P, ChromaFormat::Yuv444 => PixelFormat::Yuv444P }
 }

@@ -343,6 +343,11 @@ pub struct SliceWalkContext {
     /// `spatial_temporal_weight_code` read in `macroblock_modes()`.
     /// `0` outside spatial scalability.
     pub spatial_temporal_weight_code_table_index: u8,
+    /// Macroblocks in the picture's grid (`mb_width × mb_height`). When
+    /// set, an address at or beyond it is rejected before that macroblock
+    /// is parsed, decoded or recorded. `None` bounds addresses only by the
+    /// `u32` range.
+    pub picture_macroblocks: Option<u32>,
 }
 
 impl SliceWalkContext {
@@ -388,6 +393,7 @@ impl SliceWalkContext {
             quantiser_matrices: QuantiserMatrixState::defaults(),
             macroblock_type_table: MacroblockTypeTable::NonScalable,
             spatial_temporal_weight_code_table_index: 0,
+            picture_macroblocks: None,
         }
     }
 
@@ -426,6 +432,7 @@ impl SliceWalkContext {
             quantiser_matrices: QuantiserMatrixState::defaults(),
             macroblock_type_table: MacroblockTypeTable::NonScalable,
             spatial_temporal_weight_code_table_index: 0,
+            picture_macroblocks: None,
         }
     }
 
@@ -488,6 +495,7 @@ impl SliceWalkContext {
             quantiser_matrices: QuantiserMatrixState::defaults(),
             macroblock_type_table: MacroblockTypeTable::NonScalable,
             spatial_temporal_weight_code_table_index: 0,
+            picture_macroblocks: None,
         }
     }
 
@@ -526,6 +534,7 @@ impl SliceWalkContext {
             quantiser_matrices: QuantiserMatrixState::defaults(),
             macroblock_type_table: MacroblockTypeTable::NonScalable,
             spatial_temporal_weight_code_table_index: 0,
+            picture_macroblocks: None,
         }
     }
 
@@ -597,6 +606,7 @@ impl SliceWalkContext {
             quantiser_matrices: QuantiserMatrixState::defaults(),
             macroblock_type_table: MacroblockTypeTable::NonScalable,
             spatial_temporal_weight_code_table_index: 0,
+            picture_macroblocks: None,
         }
     }
 
@@ -650,6 +660,25 @@ impl SliceWalkContext {
         self.spatial_temporal_weight_code_table_index = spatial_temporal_weight_code_table_index;
         self
     }
+
+    /// Bound macroblock addresses by the picture's macroblock count
+    /// (§6.3.17.1), so a slice cannot expand past the picture.
+    pub const fn with_picture_macroblocks(mut self, count: usize) -> Self {
+        self.picture_macroblocks = Some(if count > u32::MAX as usize { u32::MAX } else { count as u32 });
+        self
+    }
+}
+
+/// §6.1.2.2: a picture's slices enclose each macroblock once. Rejecting
+/// coverage beyond the grid as soon as a slice exceeds it bounds a
+/// picture's slice work by twice its macroblock count.
+pub(crate) fn check_slice_coverage(placed: usize, picture_macroblocks: usize) -> Result<()> {
+    if placed > picture_macroblocks {
+        return Err(Error::InvalidBitstream(
+            "§6.1.2.2: the picture's slices cover more macroblocks than it contains",
+        ));
+    }
+    Ok(())
 }
 
 /// Per-macroblock summary the walker emits for one iteration of the
@@ -1085,23 +1114,21 @@ pub fn walk_slice_at(
                 "macroblock_address: i64 overflow (§6.3.17.1)",
             ))?;
 
-        // §6.3.17.1: macroblock_address must stay within
-        // mb_row * mb_width <= addr < mb_width * (mb_row + 1) +
-        // mb_width * remaining_rows — i.e. within the picture extent.
-        // We don't know mb_height here (the caller's concern), so we
-        // bound only against "still on the same row" optimistically;
-        // strict mb_height bounding is deferred to the picture-level
-        // driver.
+        // §6.3.17.1: macroblock_address stays within the picture's
+        // macroblock grid; the picture-level drivers supply its extent.
         if macroblock_address < 0 {
             return Err(Error::InvalidBitstream(
                 "macroblock_address: went negative — increment skipped past start of slice (§6.3.17.1)",
             ));
         }
-        // u32 upper-bound check — slice walks cannot run beyond u32
-        // worth of macroblocks. Real pictures cap at <2^20.
         if macroblock_address > i64::from(u32::MAX) {
             return Err(Error::InvalidBitstream(
                 "macroblock_address: exceeded u32 range (§6.3.17.1)",
+            ));
+        }
+        if ctx.picture_macroblocks.is_some_and(|count| macroblock_address >= i64::from(count)) {
+            return Err(Error::InvalidBitstream(
+                "macroblock_address: beyond the picture's macroblock grid (§6.3.17.1)",
             ));
         }
         let macroblock_address_u32 = macroblock_address as u32;

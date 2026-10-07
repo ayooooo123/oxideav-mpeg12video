@@ -179,7 +179,7 @@ fn ffmpeg_timing(path: &Path) -> (TimeBase, Vec<Option<i64>>) {
     (TimeBase::new(num.parse().unwrap(), den.parse().unwrap()), times)
 }
 
-fn generated(name: &str, options: &[(&str, &str)]) -> PathBuf {
+fn generated(name: &str, frames: usize, options: &[(&str, &str)]) -> PathBuf {
     let mut params = CodecParameters::video(CodecId::new("mpeg2video"));
     params.width = Some(64);
     params.height = Some(48);
@@ -189,7 +189,7 @@ fn generated(name: &str, options: &[(&str, &str)]) -> PathBuf {
         params.options.insert(*key, *value);
     }
     let mut enc = make_encoder(&params).unwrap();
-    for t in 0..12usize {
+    for t in 0..frames {
         let plane = |w: usize, h: usize, seed: usize| VideoPlane {
             stride: w,
             data: (0..w * h).map(|i| (40 + (i * 7 + t * 13 + seed) % 170) as u8).collect(),
@@ -218,9 +218,9 @@ fn display_durations_match_ffmpeg_for_fields_mpeg1_and_repeat_first_field() {
         fixture("fieldpics-48x64.m2v"),
         fixture("mpeg1-ibbp-96x64.m1v"),
         // Interlaced 3:2 pulldown: three- and two-field frames.
-        generated("pulldown.m2v", &[("interlaced", "true"), ("pulldown", "3:2"), ("b_between", "1")]),
+        generated("pulldown.m2v", 12, &[("interlaced", "true"), ("pulldown", "3:2"), ("b_between", "1")]),
         // Progressive top_field_first + repeat_first_field: three frames each.
-        generated("tripled.m2v", &[("top_field_first", "true"), ("repeat_first_field", "true"), ("b_between", "1")]),
+        generated("tripled.m2v", 12, &[("top_field_first", "true"), ("repeat_first_field", "true"), ("b_between", "1")]),
     ];
     for path in inputs {
         let (base, reference) = ffmpeg_timing(&path);
@@ -236,4 +236,116 @@ fn display_durations_match_ffmpeg_for_fields_mpeg1_and_repeat_first_field() {
         }
         assert!(compared + 3 >= ours.len(), "{}: only {compared} reference durations", path.display());
     }
+}
+
+#[test]
+fn an_unreduced_time_base_times_frames_like_its_reduced_form() {
+    // (M, M) and (1, 1) both mean one second per tick. 30 frames at 25 Hz
+    // are followed by 12 at 30000/1001 Hz, starting M - 100 seconds in.
+    let m = i64::MAX;
+    let mut data = std::fs::read(fixture("mpeg2-ibbp-96x64.m2v")).unwrap();
+    let mut ntsc = std::fs::read(generated("ntsc.m2v", 12, &[("b_between", "1")])).unwrap();
+    // Declare 30000/1001 Hz (Table 6-4 code 4) in its sequence headers.
+    for i in 0..ntsc.len() - 7 {
+        if ntsc[i..i + 4] == [0, 0, 1, 0xB3] {
+            ntsc[i + 7] = (ntsc[i + 7] & 0xF0) | 4;
+        }
+    }
+    data.extend(ntsc);
+    let decode = |base: TimeBase| {
+        let mut dec = decoder();
+        let mut out = Vec::new();
+        for (index, chunk) in data.chunks(997).enumerate() {
+            let mut packet = Packet::new(0, base, chunk.to_vec());
+            packet.pts = (index == 0).then_some(m - 100);
+            dec.send_packet(&packet).unwrap();
+            collect_pts(&mut dec, &mut out);
+        }
+        dec.flush().unwrap();
+        collect_pts(&mut dec, &mut out);
+        out
+    };
+    let reduced = decode(TimeBase::new(1, 1));
+    assert_eq!(decode(TimeBase::new(m, m)), reduced);
+    // Display k of 30 at 1/25 s, then j of 12 at 1001/30000 s, in units of
+    // 1/750000 s from M - 100, rounded to the nearest second. At j = 8 the
+    // two rates round differently, so the rate change is observable.
+    let units = (0..30).map(|k| k * 30_000).chain((0..12).map(|j| 900_000 + j * 25_025));
+    let expected: Vec<_> = units.map(|u: i64| Some(m - 100 + (2 * u + 750_000) / 1_500_000)).collect();
+    assert_eq!(reduced, expected);
+}
+
+#[test]
+fn an_unrepresentable_interpolated_time_is_an_error() {
+    let data = std::fs::read(fixture("mpeg2-ibbp-96x64.m2v")).unwrap();
+    let mut packet = Packet::new(0, TimeBase::new(1, 90_000), data);
+    packet.pts = Some(i64::MAX - 10);
+    let mut dec = decoder();
+    dec.send_packet(&packet).unwrap();
+    dec.flush().unwrap();
+    let Ok(Frame::Video(first)) = dec.receive_frame() else { panic!("first frame") };
+    assert_eq!(first.pts, Some(i64::MAX - 10));
+    // The next frame would start 3600 ticks later, past i64::MAX.
+    assert!(matches!(dec.receive_frame(), Err(Error::InvalidData(_))));
+}
+
+fn ffmpeg_frames(path: &Path) -> Vec<u8> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-f", "mpegvideo", "-idct", "simple", "-i"])
+        .arg(path).args(["-fps_mode", "passthrough", "-pix_fmt", "yuv420p", "-f", "rawvideo", "-"])
+        .output().expect("FFmpeg is required for the independent oracle");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    out.stdout
+}
+
+#[test]
+fn low_delay_pictures_leave_at_their_own_decode_time() {
+    // An I/P/P stream, flagged low_delay in its sequence_extension: no
+    // B-pictures, so no picture waits for a later anchor.
+    let path = generated("lowdelay.m2v", 3, &[("b_between", "0")]);
+    let mut data = std::fs::read(&path).unwrap();
+    let extension = data.windows(5).position(|w| w[..4] == [0, 0, 1, 0xB5] && w[4] >> 4 == 1).unwrap();
+    data[extension + 9] |= 0x80;
+    let parsed = oxideav_mpeg12video::sequence_extension::Mpeg2SequenceExtension::parse(&data[extension..]);
+    assert!(parsed.unwrap().low_delay);
+    // Without a trailing sequence_end_code the last picture completes at flush.
+    if data.ends_with(&[0, 0, 1, 0xB7]) {
+        data.truncate(data.len() - 4);
+    }
+    std::fs::write(&path, &data).unwrap();
+    let pictures: Vec<usize> = data.windows(4).enumerate()
+        .filter_map(|(i, w)| (w == [0, 0, 1, 0]).then_some(i)).collect();
+    assert_eq!(pictures.len(), 3);
+    let bounds = [0, pictures[1], pictures[2], data.len()];
+
+    let mut dec = decoder();
+    let (mut times, mut pixels, mut released) = (Vec::new(), Vec::new(), Vec::new());
+    let mut drain = |dec: &mut Mpeg12Decoder| {
+        let mut count = 0;
+        loop {
+            match dec.receive_frame() {
+                Ok(Frame::Video(frame)) => {
+                    times.push(frame.pts);
+                    frame.planes.iter().for_each(|p| pixels.extend_from_slice(&p.data));
+                    count += 1;
+                }
+                Ok(_) => panic!("non-video output"),
+                Err(Error::NeedMore | Error::Eof) => return count,
+                Err(err) => panic!("decode: {err}"),
+            }
+        }
+    };
+    // Packets carry DTS 0, 1, 2 and no PTS.
+    for (dts, range) in bounds.windows(2).enumerate() {
+        let mut packet = Packet::new(0, TimeBase::new(1, 25), data[range[0]..range[1]].to_vec());
+        packet.dts = Some(dts as i64);
+        dec.send_packet(&packet).unwrap();
+        released.push(drain(&mut dec));
+    }
+    dec.flush().unwrap();
+    released.push(drain(&mut dec));
+    // A picture is complete when the next one starts and leaves then.
+    assert_eq!(released, vec![0, 1, 1, 1]);
+    assert_eq!(times, vec![Some(0), Some(1), Some(2)]);
+    assert_eq!(pixels, ffmpeg_frames(&path));
 }

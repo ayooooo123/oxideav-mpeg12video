@@ -1,8 +1,10 @@
 //! Encoder and decoder conformance: all committed fixtures retain their
 //! original independent references and source-fidelity bounds. Newly encoded
-//! streams are decoded independently by FFmpeg `-idct simple`, byte-for-byte.
-//! Encoder bitstreams are not implementation snapshots: corrected reference
-//! reconstruction may legitimately change their coefficients and mode choices.
+//! streams must decode to the requested frames within the same fidelity
+//! bound, satisfy the same structural and Annex C checks, and match FFmpeg
+//! `-idct simple` byte-for-byte. Encoder bitstreams are not implementation
+//! snapshots: corrected reference reconstruction may legitimately change
+//! their coefficients and mode choices.
 
 use oxideav_mpeg12video::sequence_extension::ChromaFormat;
 use oxideav_mpeg12video::vbv::{verify_cbr_stream, VbvStandard};
@@ -80,16 +82,41 @@ fn packed(frame: &DecodedFrame) -> Vec<u8> {
     out
 }
 
-fn assert_simple_output(stream: &[u8]) {
-    use std::{path::PathBuf, process::Command, sync::atomic::{AtomicUsize, Ordering}};
-    static INDEX: AtomicUsize = AtomicUsize::new(0);
+/// The requested frame count and, per frame, a bounded mean absolute luma
+/// error against the input that frame encodes (display order).
+fn assert_source_fidelity(name: &str, frames: &[DecodedFrame], display_inputs: &[&FrameBuffer]) {
+    assert_eq!(frames.len(), display_inputs.len(), "{name}: frame count");
+    for (index, (frame, input)) in frames.iter().zip(display_inputs).enumerate() {
+        let mut total = 0u64;
+        let mut count = 0u64;
+        for y in 0..input.height {
+            for x in 0..input.width {
+                let a = i64::from(input.y.get(x, y).unwrap());
+                let b = i64::from(frame.frame.y.get(x, y).unwrap());
+                total += a.abs_diff(b);
+                count += 1;
+            }
+        }
+        let mae = total as f64 / count as f64;
+        assert!(
+            mae < 8.0,
+            "{name}: frame {index} luma MAE {mae:.2} — round-trip fidelity lost"
+        );
+    }
+}
+
+/// Newly encoded output: the requested frames within the source-fidelity
+/// bound, and FFmpeg's complete `-idct simple` decode of the same bytes.
+fn assert_regenerated(name: &str, stream: &[u8], display_inputs: &[&FrameBuffer]) {
+    use std::{path::PathBuf, process::Command};
     let dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
         .join("evidence").join(format!("selfenc-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("{}.mpegvideo", INDEX.fetch_add(1, Ordering::Relaxed)));
+    let path = dir.join(format!("{name}.mpegvideo"));
     std::fs::write(&path, stream).unwrap();
     let frames = decode_video_sequence(stream).expect("new encoder output decodes");
+    assert_source_fidelity(&format!("{name} (regenerated)"), &frames, display_inputs);
     let format = match frames[0].frame.chroma_format {
         ChromaFormat::Yuv420 => "yuv420p",
         ChromaFormat::Yuv422 => "yuv422p",
@@ -116,7 +143,7 @@ fn assert_reference_conformant(
     display_inputs: &[&FrameBuffer],
 ) {
     let frames = decode_video_sequence(stream).expect("self-encoded stream decodes");
-    assert_eq!(frames.len(), display_inputs.len(), "{name}: frame count");
+    assert_source_fidelity(name, &frames, display_inputs);
 
     let frame_bytes = reference.len() / display_inputs.len();
     for (index, frame) in frames.iter().enumerate() {
@@ -140,25 +167,6 @@ fn assert_reference_conformant(
             per_mille <= MAX_DIFF_PER_MILLE,
             "{name}: frame {index}: {per_mille}‰ samples differ — structural divergence"
         );
-
-        // Round-trip fidelity: bounded mean absolute luma error
-        // against the synthetic input this frame encodes.
-        let input = display_inputs[index];
-        let mut total = 0u64;
-        let mut count = 0u64;
-        for y in 0..input.height {
-            for x in 0..input.width {
-                let a = i64::from(input.y.get(x, y).unwrap());
-                let b = i64::from(frame.frame.y.get(x, y).unwrap());
-                total += a.abs_diff(b);
-                count += 1;
-            }
-        }
-        let mae = total as f64 / count as f64;
-        assert!(
-            mae < 8.0,
-            "{name}: frame {index} luma MAE {mae:.2} — round-trip fidelity lost"
-        );
     }
 }
 
@@ -167,7 +175,7 @@ fn selfenc_intra_64x48_is_pinned_and_reference_conformant() {
     let (stream, reference) = fixture("selfenc-intra-64x48.m2v");
     let input = frame_at(64, 48, 0, 0, false);
     let regenerated = encode_intra_picture(&input, params(64, 48), 0, 6).expect("intra re-encode");
-    assert_simple_output(&regenerated);
+    assert_regenerated("selfenc-intra-64x48", &regenerated, &[&input]);
     assert_reference_conformant("selfenc-intra-64x48", &stream, &reference, &[&input]);
 }
 
@@ -176,7 +184,7 @@ fn selfenc_intra_100x62_is_pinned_and_reference_conformant() {
     let (stream, reference) = fixture("selfenc-intra-100x62.m2v");
     let input = frame_at(100, 62, 0, 0, false);
     let regenerated = encode_intra_picture(&input, params(100, 62), 0, 5).expect("intra re-encode");
-    assert_simple_output(&regenerated);
+    assert_regenerated("selfenc-intra-100x62", &regenerated, &[&input]);
     assert_reference_conformant("selfenc-intra-100x62", &stream, &reference, &[&input]);
 }
 
@@ -191,7 +199,11 @@ fn selfenc_ip_chain_is_pinned_and_reference_conformant() {
     ];
     let regenerated =
         encode_i_p_chain(&anchor, &targets, params(64, 48), 6, 3).expect("chain re-encode");
-    assert_simple_output(&regenerated);
+    assert_regenerated(
+        "selfenc-ipchain-64x48",
+        &regenerated,
+        &[&anchor, &targets[0], &targets[1], &targets[2]],
+    );
     assert_reference_conformant(
         "selfenc-ipchain-64x48",
         &stream,
@@ -206,8 +218,8 @@ fn selfenc_ibbp_sequence_is_pinned_and_reference_conformant() {
     let display: Vec<FrameBuffer> = (0..7).map(|k| frame_at(64, 48, 2 * k, k, k == 3)).collect();
     let regenerated = encode_display_order_sequence(&display, 2, params(64, 48), 6, 3, 3)
         .expect("ibbp re-encode");
-    assert_simple_output(&regenerated);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-ibbp-64x48", &regenerated, &inputs);
     assert_reference_conformant("selfenc-ibbp-64x48", &stream, &reference, &inputs);
 }
 
@@ -217,8 +229,8 @@ fn selfenc_mpeg2_gop_sequence_is_pinned_and_reference_conformant() {
     let display: Vec<FrameBuffer> = (0..8).map(|k| frame_at(48, 32, 2 * k, k, false)).collect();
     let regenerated = encode_display_order_gop_sequence(&display, 1, 2, params(48, 32), 6, 3, 3)
         .expect("gop re-encode");
-    assert_simple_output(&regenerated);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-gops-48x32", &regenerated, &inputs);
     assert_reference_conformant("selfenc-gops-48x32", &stream, &reference, &inputs);
 }
 
@@ -236,7 +248,7 @@ fn selfenc_mpeg1_intra_is_pinned_and_reference_conformant() {
     let input = frame_at(64, 48, 0, 0, false);
     let regenerated =
         encode_mpeg1_intra_stream(&input, &mpeg1_seq(64, 48), 6).expect("mpeg1 intra re-encode");
-    assert_simple_output(&regenerated);
+    assert_regenerated("selfenc-mpeg1-intra-64x48", &regenerated, &[&input]);
     assert_reference_conformant("selfenc-mpeg1-intra-64x48", &stream, &reference, &[&input]);
 }
 
@@ -252,8 +264,8 @@ fn selfenc_mpeg1_ippp_chain_is_pinned_and_reference_conformant() {
     let regenerated =
         encode_mpeg1_display_order_sequence(&display, 0, 3, &mpeg1_seq(64, 48), 6, 3, 3)
             .expect("mpeg1 ippp re-encode");
-    assert_simple_output(&regenerated);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-mpeg1-ippp-64x48", &regenerated, &inputs);
     assert_reference_conformant("selfenc-mpeg1-ippp-64x48", &stream, &reference, &inputs);
 }
 
@@ -264,8 +276,8 @@ fn selfenc_mpeg1_two_gop_ibbp_is_pinned_and_reference_conformant() {
     let regenerated =
         encode_mpeg1_display_order_sequence(&display, 2, 1, &mpeg1_seq(64, 48), 6, 3, 3)
             .expect("mpeg1 ibbp re-encode");
-    assert_simple_output(&regenerated);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-mpeg1-ibbp2gop-64x48", &regenerated, &inputs);
     assert_reference_conformant("selfenc-mpeg1-ibbp2gop-64x48", &stream, &reference, &inputs);
 }
 
@@ -281,15 +293,17 @@ fn selfenc_mpeg2_cbr_is_pinned_reference_and_vbv_conformant() {
     };
     let regenerated =
         encode_cbr_gop_sequence(&display, 1, 2, params(64, 48), &cbr, 3, 3).expect("cbr re-encode");
-    assert_simple_output(&regenerated.stream);
-    // Annex C: the committed stream satisfies the bit_rate /
-    // vbv_buffer_size it declares, with C.3.1-consistent vbv_delay in
-    // every picture header.
-    let report = verify_cbr_stream(&stream, VbvStandard::Mpeg2).expect("VBV conformant");
-    assert_eq!(report.bit_rate, 240_000);
-    assert_eq!(report.buffer_size_bits, 65_536);
-    assert_eq!(report.pictures.len(), 8);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-cbr-64x48", &regenerated.stream, &inputs);
+    // Annex C: the committed and the regenerated stream satisfy the
+    // bit_rate / vbv_buffer_size they declare, with C.3.1-consistent
+    // vbv_delay in every picture header.
+    for cbr_stream in [&stream, &regenerated.stream] {
+        let report = verify_cbr_stream(cbr_stream, VbvStandard::Mpeg2).expect("VBV conformant");
+        assert_eq!(report.bit_rate, 240_000);
+        assert_eq!(report.buffer_size_bits, 65_536);
+        assert_eq!(report.pictures.len(), 8);
+    }
     assert_reference_conformant("selfenc-cbr-64x48", &stream, &reference, &inputs);
 }
 
@@ -304,12 +318,14 @@ fn selfenc_mpeg1_cbr_is_pinned_reference_and_vbv_conformant() {
     };
     let regenerated =
         encode_mpeg1_cbr_sequence(&display, 2, 1, &seq_cbr, 6, 3, 3).expect("mpeg1 cbr re-encode");
-    assert_simple_output(&regenerated.stream);
-    let report = verify_cbr_stream(&stream, VbvStandard::Mpeg1).expect("VBV conformant");
-    assert_eq!(report.bit_rate, 240_000);
-    assert_eq!(report.buffer_size_bits, 65_536);
-    assert_eq!(report.pictures.len(), 8);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-mpeg1-cbr-64x48", &regenerated.stream, &inputs);
+    for cbr_stream in [&stream, &regenerated.stream] {
+        let report = verify_cbr_stream(cbr_stream, VbvStandard::Mpeg1).expect("VBV conformant");
+        assert_eq!(report.bit_rate, 240_000);
+        assert_eq!(report.buffer_size_bits, 65_536);
+        assert_eq!(report.pictures.len(), 8);
+    }
     assert_reference_conformant("selfenc-mpeg1-cbr-64x48", &stream, &reference, &inputs);
 }
 
@@ -359,8 +375,8 @@ fn selfenc_field_sequence_is_pinned_and_reference_conformant() {
         3,
     )
     .expect("field sequence re-encode");
-    assert_simple_output(&regenerated);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-fieldseq-48x64", &regenerated, &inputs);
     assert_reference_conformant("selfenc-fieldseq-48x64", &stream, &reference, &inputs);
 }
 
@@ -414,12 +430,12 @@ fn selfenc_frame_field_sequence_is_pinned_and_reference_conformant() {
     let (regenerated, stats) =
         encode_ff_display_order_gop_sequence(&display, 1, 2, &ff_params_64(), 6, 3, 3, false)
             .expect("frame-field re-encode");
-    assert_simple_output(&regenerated);
+    let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-framefield-64x64", &regenerated, &inputs);
     // The stream genuinely exercises the frame_pred_frame_dct = 0
     // surface: field-based macroblocks and field-DCT macroblocks.
     assert!(stats.field_mc > 0, "field MC coded: {stats:?}");
     assert!(stats.field_dct > 0, "field DCT coded: {stats:?}");
-    let inputs: Vec<&FrameBuffer> = display.iter().collect();
     assert_reference_conformant("selfenc-framefield-64x64", &stream, &reference, &inputs);
 }
 
@@ -458,9 +474,9 @@ fn selfenc_dual_prime_sequence_is_pinned_and_reference_conformant() {
     let (regenerated, stats) =
         encode_ff_display_order_gop_sequence(&display, 0, 2, &ff_params_64(), 6, 3, 3, true)
             .expect("dual-prime re-encode");
-    assert_simple_output(&regenerated);
-    assert!(stats.dual_prime > 0, "dual-prime coded: {stats:?}");
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-dualprime-64x64", &regenerated, &inputs);
+    assert!(stats.dual_prime > 0, "dual-prime coded: {stats:?}");
     assert_reference_conformant("selfenc-dualprime-64x64", &stream, &reference, &inputs);
 }
 
@@ -528,11 +544,11 @@ fn selfenc_field_modes_sequence_is_pinned_and_reference_conformant() {
             &display, 0, 2, &fa_params, 6, 3, 3, true,
         )
         .expect("adaptive field re-encode");
-    assert_simple_output(&regenerated);
+    let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-fieldmodes-64x64", &regenerated, &inputs);
     // The stream genuinely exercises the Table 6-18 mode surface.
     assert!(stats.sixteen_by_eight > 0, "16x8 coded: {stats:?}");
     assert!(stats.dual_prime > 0, "dual-prime coded: {stats:?}");
-    let inputs: Vec<&FrameBuffer> = display.iter().collect();
     assert_reference_conformant("selfenc-fieldmodes-64x64", &stream, &reference, &inputs);
 }
 
@@ -601,8 +617,8 @@ fn selfenc_mpeg1_loaded_matrices_is_pinned_and_reference_conformant() {
     let display: Vec<FrameBuffer> = (0..3).map(|k| frame_at(48, 32, 2 * k, k, false)).collect();
     let regenerated = encode_mpeg1_display_order_sequence(&display, 1, 1, &seq_qmat, 6, 3, 3)
         .expect("mpeg1 qmat re-encode");
-    assert_simple_output(&regenerated);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-mpeg1-qmat-48x32", &regenerated, &inputs);
     assert_reference_conformant("selfenc-mpeg1-qmat-48x32", &stream, &reference, &inputs);
 }
 
@@ -614,7 +630,7 @@ fn selfenc_ipb_group_is_pinned_and_reference_conformant() {
     let p_frame = frame_at(64, 48, 4, 2, false);
     let regenerated = encode_i_p_b(&i_frame, &b_frame, &p_frame, params(64, 48), 6, 3, 3)
         .expect("i-p-b re-encode");
-    assert_simple_output(&regenerated);
+    assert_regenerated("selfenc-ipb-64x48", &regenerated, &[&i_frame, &b_frame, &p_frame]);
     // Display order: I, B, P.
     assert_reference_conformant(
         "selfenc-ipb-64x48",
@@ -675,8 +691,8 @@ fn selfenc_422_ibbp_is_pinned_and_reference_conformant() {
     let regenerated =
         encode_display_order_gop_sequence(&display, 1, 4, params_422(64, 48), 6, 3, 3)
             .expect("4:2:2 gop re-encode");
-    assert_simple_output(&regenerated);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-422-ibbp-64x48", &regenerated, &inputs);
     assert_reference_conformant("selfenc-422-ibbp-64x48", &stream, &reference, &inputs);
 }
 
@@ -724,8 +740,8 @@ fn selfenc_422_full_flags_is_pinned_and_reference_conformant() {
         &matrices,
     )
     .expect("4:2:2 full-flag re-encode");
-    assert_simple_output(&regenerated);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-422-full-64x48", &regenerated, &inputs);
     assert_reference_conformant("selfenc-422-full-64x48", &stream, &reference, &inputs);
 }
 
@@ -756,8 +772,8 @@ fn selfenc_444_ibp_is_pinned_and_reference_conformant() {
     };
     let regenerated = encode_display_order_gop_sequence(&display, 1, 2, p444, 6, 3, 3)
         .expect("4:4:4 gop re-encode");
-    assert_simple_output(&regenerated);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-444-ibp-64x48", &regenerated, &inputs);
     assert_reference_conformant("selfenc-444-ibp-64x48", &stream, &reference, &inputs);
 }
 
@@ -805,8 +821,8 @@ fn selfenc_skip_and_concealment_is_pinned_and_reference_conformant() {
     .expect("skip/concealment re-encode");
     assert!(stats.skipped > 0, "skips must fire: {stats:?}");
     assert!(stats.intra > 12, "intra fallbacks must fire: {stats:?}");
-    assert_simple_output(&regenerated);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-skipconceal-64x48", &regenerated, &inputs);
     assert_reference_conformant("selfenc-skipconceal-64x48", &stream, &reference, &inputs);
 }
 
@@ -864,8 +880,8 @@ fn selfenc_framefield_full_flags_is_pinned_and_reference_conformant() {
         encode_ff_display_order_gop_sequence(&display, 1, 2, &ff_params, 6, 3, 3, false)
             .expect("full-flag frame-field re-encode");
     assert!(stats.field_mc > 0, "field MC must fire: {stats:?}");
-    assert_simple_output(&regenerated);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-fffull-64x64", &regenerated, &inputs);
     assert_reference_conformant("selfenc-fffull-64x64", &stream, &reference, &inputs);
 }
 
@@ -1013,8 +1029,8 @@ fn selfenc_422_field_sequence_is_pinned_and_reference_conformant() {
         3,
     )
     .expect("4:2:2 field sequence re-encode");
-    assert_simple_output(&regenerated);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-422-fieldseq-48x64", &regenerated, &inputs);
     assert_reference_conformant("selfenc-422-fieldseq-48x64", &stream, &reference, &inputs);
 }
 
@@ -1037,8 +1053,8 @@ fn selfenc_422_frame_field_sequence_is_pinned_and_reference_conformant() {
     )
     .expect("4:2:2 frame-field re-encode");
     assert!(stats.field_mc > 0 && stats.field_dct > 0, "{stats:?}");
-    assert_simple_output(&regenerated);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-422-framefield-64x64", &regenerated, &inputs);
     assert_reference_conformant("selfenc-422-framefield-64x64", &stream, &reference, &inputs);
 }
 
@@ -1061,8 +1077,8 @@ fn selfenc_422_field_modes_sequence_is_pinned_and_reference_conformant() {
         stats.sixteen_by_eight > 0 && stats.dual_prime > 0,
         "{stats:?}"
     );
-    assert_simple_output(&regenerated);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-422-fieldmodes-64x64", &regenerated, &inputs);
     assert_reference_conformant("selfenc-422-fieldmodes-64x64", &stream, &reference, &inputs);
 }
 
@@ -1085,8 +1101,8 @@ fn selfenc_444_frame_field_sequence_is_pinned_and_reference_conformant() {
     )
     .expect("4:4:4 frame-field re-encode");
     assert!(stats.field_dct > 0, "{stats:?}");
-    assert_simple_output(&regenerated);
     let inputs: Vec<&FrameBuffer> = display.iter().collect();
+    assert_regenerated("selfenc-444-framefield-64x64", &regenerated, &inputs);
     assert_reference_conformant("selfenc-444-framefield-64x64", &stream, &reference, &inputs);
 }
 
@@ -1131,8 +1147,8 @@ fn selfenc_snr_pair_is_pinned_base_reference_conformant_and_loop_exact() {
     let regenerated_base =
         encode_display_order_gop_sequence(&sources, 1, 2, params(64, 48), 14, 3, 3)
             .expect("lower layer re-encode");
-    assert_simple_output(&regenerated_base);
     let inputs: Vec<&FrameBuffer> = sources.iter().collect();
+    assert_regenerated("selfenc-snr-base-64x48", &regenerated_base, &inputs);
     assert_reference_conformant("selfenc-snr-base-64x48", &base, &reference, &inputs);
 
     // Compare the new encoder's reconstruction to a separate decode, while
@@ -1143,6 +1159,7 @@ fn selfenc_snr_pair_is_pinned_base_reference_conformant_and_loop_exact() {
     assert_eq!(legacy.len(), sources.len());
     let combined = oxideav_mpeg12video::decode_snr_scalable_sequence(&base, &regenerated.stream)
         .expect("new two-layer decode");
+    assert_eq!(combined.len(), sources.len());
     assert_eq!(combined.len(), regenerated.recon.len());
     for (i, (a, b)) in combined.iter().zip(&regenerated.recon).enumerate() {
         assert_eq!(a.frame.y.samples(), b.frame.y.samples(), "frame {i} luma");
@@ -1184,8 +1201,8 @@ fn selfenc_temporal_pair_is_pinned_base_reference_conformant_and_loop_exact() {
 
     let regenerated_base = encode_display_order_gop_sequence(&lower, 1, 2, params(64, 48), 8, 3, 3)
         .expect("lower layer re-encode");
-    assert_simple_output(&regenerated_base);
     let inputs: Vec<&FrameBuffer> = lower.iter().collect();
+    assert_regenerated("selfenc-temporal-base-64x48", &regenerated_base, &inputs);
     assert_reference_conformant("selfenc-temporal-base-64x48", &base, &reference, &inputs);
 
     let regenerated = oxideav_mpeg12video::encode_temporal_enhancement_layer(
@@ -1291,8 +1308,8 @@ fn selfenc_spatial_pair_is_pinned_base_reference_conformant_and_loop_exact() {
 
     let regenerated_base = encode_display_order_gop_sequence(&lower, 1, 2, params(32, 24), 6, 3, 3)
         .expect("lower layer re-encode");
-    assert_simple_output(&regenerated_base);
     let inputs: Vec<&FrameBuffer> = lower.iter().collect();
+    assert_regenerated("selfenc-spatial-base-32x24", &regenerated_base, &inputs);
     assert_reference_conformant("selfenc-spatial-base-32x24", &base, &reference, &inputs);
 
     let regenerated = oxideav_mpeg12video::encode_spatial_enhancement_layer(
@@ -1349,19 +1366,22 @@ fn selfenc_mpeg2_multi_slice_rows_are_pinned_and_reference_conformant() {
         3,
     )
     .expect("slice-length re-encode");
-    assert_simple_output(&regenerated);
-    // Two slices per row: 3 rows × 2.
-    let slices = stream
-        .windows(4)
-        .filter(|w| w[0] == 0 && w[1] == 0 && w[2] == 1 && (0x01..=0xAF).contains(&w[3]))
-        .count();
-    assert_eq!(slices, 6);
+    assert_regenerated("selfenc-slices3-64x48", &regenerated, &[&input]);
+    // Two slices per row: 3 rows × 2, committed and regenerated.
+    let slices = |s: &[u8]| {
+        s.windows(4)
+            .filter(|w| w[0] == 0 && w[1] == 0 && w[2] == 1 && (0x01..=0xAF).contains(&w[3]))
+            .count()
+    };
+    assert_eq!((slices(&stream), slices(&regenerated)), (6, 6));
     assert_reference_conformant("selfenc-slices3-64x48", &stream, &reference, &[&input]);
     // Same reconstruction as the one-slice-per-row encode.
     let rows = decode_video_sequence(&encode_intra_picture(&input, params(64, 48), 0, 6).unwrap())
         .unwrap();
-    let ours = decode_video_sequence(&stream).unwrap();
-    assert_eq!(ours[0].frame.y.samples(), rows[0].frame.y.samples());
+    for multi_slice in [&stream, &regenerated] {
+        let ours = decode_video_sequence(multi_slice).unwrap();
+        assert_eq!(ours[0].frame.y.samples(), rows[0].frame.y.samples());
+    }
 }
 
 #[test]
@@ -1392,21 +1412,26 @@ fn selfenc_mpeg1_row_spanning_slices_are_pinned_and_reference_conformant() {
     .expect("slice-length re-encode");
     let mut regenerated = bw.finish();
     regenerated.extend_from_slice(&0x0000_01B7u32.to_be_bytes());
-    assert_simple_output(&regenerated);
+    assert_regenerated("selfenc-mpeg1-slices5-64x48", &regenerated, &[&input]);
     // Slices of 5 / 5 / 2 macroblocks: three slices, the second and
-    // third starting mid-row and the first two spanning rows.
-    let positions: Vec<u8> = stream
-        .windows(4)
-        .filter(|w| w[0] == 0 && w[1] == 0 && w[2] == 1 && (0x01..=0xAF).contains(&w[3]))
-        .map(|w| w[3])
-        .collect();
-    assert_eq!(positions, vec![1, 2, 3]);
+    // third starting mid-row and the first two spanning rows, committed
+    // and regenerated.
+    let positions = |s: &[u8]| -> Vec<u8> {
+        s.windows(4)
+            .filter(|w| w[0] == 0 && w[1] == 0 && w[2] == 1 && (0x01..=0xAF).contains(&w[3]))
+            .map(|w| w[3])
+            .collect()
+    };
+    assert_eq!(positions(&stream), vec![1, 2, 3]);
+    assert_eq!(positions(&regenerated), vec![1, 2, 3]);
     assert_reference_conformant(
         "selfenc-mpeg1-slices5-64x48",
         &stream,
         &reference,
         &[&input],
     );
-    let ours = decode_video_sequence(&stream).unwrap();
-    assert_eq!(ours[0].frame.y.samples(), recon.y.samples());
+    for row_spanning in [&stream, &regenerated] {
+        let ours = decode_video_sequence(row_spanning).unwrap();
+        assert_eq!(ours[0].frame.y.samples(), recon.y.samples());
+    }
 }

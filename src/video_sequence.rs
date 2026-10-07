@@ -92,8 +92,10 @@ use crate::mpeg1_picture::{
 use crate::picture_header::{
     Mpeg2PictureHeader, PictureCodingExtension, PictureCodingType, PictureStructure,
 };
+use crate::dual_prime::FieldParity;
 use crate::picture_reconstruction::{
-    decode_field_picture_with_matrices, decode_inter_picture_with_matrices, PicturePredictionParams,
+    decode_field_picture_from, decode_field_picture_with_matrices, decode_inter_picture_with_matrices,
+    PicturePredictionParams,
 };
 use crate::quant_matrix_extension::{QuantMatrixExtension, QuantiserMatrixState};
 use crate::sequence_extension::Mpeg2Sequence;
@@ -237,8 +239,8 @@ pub(crate) struct Released {
 #[derive(Debug, Default)]
 pub(crate) struct PictureDecoder {
     geometry: Option<SequenceGeometry>,
-    /// Frames per second as `(numerator, denominator)`.
-    frame_rate: Option<(u32, u32)>,
+    /// Frame rate and `low_delay` of the current sequence.
+    output: SequenceOutput,
     matrices: QuantiserMatrixState,
     forward: Option<std::sync::Arc<OutputPicture>>,
     backward: Option<std::sync::Arc<OutputPicture>>,
@@ -265,7 +267,7 @@ impl PictureDecoder {
     }
 
     pub(crate) fn sequence(&mut self, data: &[u8]) -> Result<()> {
-        let (geometry, frame_rate) = sequence_geometry_at(data)?;
+        let (geometry, output) = sequence_geometry_at(data)?;
         let (w, h, _) = geometry.dimensions();
         // Bound reconstruction storage before any frame/slice allocation.
         // H.262 High Level (1920x1152) fits comfortably; also retain the
@@ -278,7 +280,7 @@ impl PictureDecoder {
         }
         self.matrices = geometry.initial_matrices();
         self.geometry = Some(geometry);
-        self.frame_rate = frame_rate;
+        self.output = output;
         Ok(())
     }
 
@@ -345,15 +347,25 @@ impl PictureDecoder {
         // §6.3.10: progressive sequences repeat whole frames; interlaced
         // ones repeat the first field.
         let fields = if progressive_sequence { 2 * decoded.output_frame_count() } else { decoded.output_field_count() };
-        let duration = self.frame_rate.map(|(num, den)| (u64::from(fields) * u64::from(den), 2 * u64::from(num)));
+        let duration = self.output.frame_rate.map(|(num, den)| (u64::from(fields) * u64::from(den), 2 * u64::from(num)));
         let release_dts = frame_stamp.decode_time();
         let frame = std::sync::Arc::new(OutputPicture { decoded, stamp: frame_stamp, duration });
         let output = match frame.decoded.picture_coding_type {
             PictureCodingType::Bidirectional | PictureCodingType::DcIntra => Some(frame),
             PictureCodingType::Intra | PictureCodingType::Predictive => {
-                let output = if self.held { self.backward.clone() } else { None };
+                // As FFmpeg's slice_end: a low-delay sequence has no
+                // B-pictures, so each picture leaves as decoded; otherwise an
+                // anchor waits for the next. An anchor still held when a
+                // sequence switches to low delay is dropped, as in FFmpeg.
+                let output = if self.output.low_delay {
+                    Some(frame.clone())
+                } else if self.held {
+                    self.backward.clone()
+                } else {
+                    None
+                };
                 self.forward = self.backward.replace(frame);
-                self.held = true;
+                self.held = !self.output.low_delay;
                 output
             }
         };
@@ -640,8 +652,8 @@ impl SequenceGeometry {
 /// ISO/IEC 13818-2 sequence (§6.1.1.6 *"sequence_header() shall be
 /// followed by sequence_extension()"*); its absence makes it an
 /// ISO/IEC 11172-2 sequence, whose geometry and quantiser matrices
-/// come from the header alone (§2.4.2.3). Also returns the frame rate.
-fn sequence_geometry_at(buf: &[u8]) -> Result<(SequenceGeometry, Option<(u32, u32)>)> {
+/// come from the header alone (§2.4.2.3). Also returns its output properties.
+fn sequence_geometry_at(buf: &[u8]) -> Result<(SequenceGeometry, SequenceOutput)> {
     // Only absence of an extension selects MPEG-1. A split, truncated or
     // malformed MPEG-2 extension must never silently downgrade the stream.
     let after = crate::sequence_extension::sequence_header_byte_length(buf)?;
@@ -669,9 +681,12 @@ fn sequence_geometry_at(buf: &[u8]) -> Result<(SequenceGeometry, Option<(u32, u3
                     chroma_non_intra: None,
                 };
             header_loads.apply(&mut matrices, seq.extension.chroma_format);
-            let rate = frame_rate(seq.header.frame_rate_code,
-                seq.extension.frame_rate_extension_n, seq.extension.frame_rate_extension_d);
-            Ok((SequenceGeometry::Mpeg2(sequence_geometry(&seq), matrices), rate))
+            let output = SequenceOutput {
+                frame_rate: frame_rate(seq.header.frame_rate_code,
+                    seq.extension.frame_rate_extension_n, seq.extension.frame_rate_extension_d),
+                low_delay: seq.extension.low_delay,
+            };
+            Ok((SequenceGeometry::Mpeg2(sequence_geometry(&seq), matrices), output))
     } else {
             // No sequence_extension: ISO/IEC 11172-2. Parse the bare
             // header (geometry + optional downloadable matrices, both
@@ -693,8 +708,18 @@ fn sequence_geometry_at(buf: &[u8]) -> Result<(SequenceGeometry, Option<(u32, u3
                 height: header.height as usize,
                 intra_quant,
                 non_intra_quant,
-            }), frame_rate(header.frame_rate_code, 0, 0)))
+            }), SequenceOutput { frame_rate: frame_rate(header.frame_rate_code, 0, 0), low_delay: false }))
         }
+}
+
+/// Output properties of a sequence: its Table 6-4 frame rate (`None` for a
+/// reserved code) and the §6.3.5 `low_delay` flag. ISO/IEC 11172-2 has no
+/// low-delay signal.
+#[derive(Debug, Clone, Copy, Default)]
+struct SequenceOutput {
+    /// Frames per second as `(numerator, denominator)`.
+    frame_rate: Option<(u32, u32)>,
+    low_delay: bool,
 }
 
 /// Table 6-4 (ISO/IEC 11172-2 §2.4.3.2 for MPEG-1) in frames per second,
@@ -1043,8 +1068,10 @@ struct PendingField {
 ///   synthetic reference frame handed to the driver therefore carries the
 ///   current first field in its own parity slot and the previous frame's
 ///   field in the opposite slot ([`reference_frame_for_second_p_field`]).
-///   A second I-field needs no reference; a second B-field uses the two
-///   anchor frames like the first.
+///   At startup or after reset no previous frame exists: the first field
+///   remains a reference and a prediction from the missing field is
+///   rejected per macroblock. A second I-field needs no reference; a
+///   second B-field uses the two anchor frames like the first.
 // Every argument is §7.6.2 state the field-pair reconstruction needs
 // (the two anchors, the held first field, and the §6.3.11 matrices).
 #[allow(clippy::too_many_arguments)]
@@ -1071,20 +1098,26 @@ fn reconstruct_field_pair(
     // Build, when this is the P second field, the synthetic reference
     // frame that pairs the just-decoded first field with the previous
     // frame's opposite-parity field. Materialised here so it outlives the
-    // `ReferenceFrames` borrow below.
+    // `ReferenceFrames` borrow below. Without a previous frame only the
+    // first field exists; the missing one has the current field's parity.
     let second_field_reference =
         if is_second_field && header.picture_coding_type == PictureCodingType::Predictive {
             let pending = pending_field
                 .as_ref()
                 .expect("second field implies pending");
-            let prev = backward_anchor.ok_or(Error::InvalidBitstream(
-                "§7.6.2.1: P second field before any reference frame exists",
-            ))?;
-            Some(reference_frame_for_second_p_field(
-                &pending.field,
-                pending.structure,
-                prev,
-            )?)
+            Some(match backward_anchor {
+                Some(prev) => (
+                    reference_frame_for_second_p_field(&pending.field, pending.structure, prev)?,
+                    None,
+                ),
+                None => {
+                    let missing = match structure {
+                        PictureStructure::TopField => FieldParity::Top,
+                        _ => FieldParity::Bottom,
+                    };
+                    (assemble_frame_from_fields(&pending.field, &pending.field)?, Some(missing))
+                }
+            })
         } else {
             None
         };
@@ -1128,19 +1161,22 @@ fn reconstruct_field_pair(
         }
         PictureCodingType::Predictive => {
             let params = inter_params(header, ext, geometry);
-            let reference = if let Some(synthetic) = second_field_reference.as_ref() {
-                synthetic
-            } else {
-                backward_anchor.ok_or(Error::InvalidBitstream(
-                    "§7.6.2.1: P field before any reference frame exists",
-                ))?
+            let (reference, missing) = match second_field_reference.as_ref() {
+                Some((synthetic, missing)) => (synthetic, *missing),
+                None => (
+                    backward_anchor.ok_or(Error::InvalidBitstream(
+                        "§7.6.2.1: P field before any reference frame exists",
+                    ))?,
+                    None,
+                ),
             };
-            let (field, placed) = decode_field_picture_with_matrices(
+            let (field, placed) = decode_field_picture_from(
                 picture_region,
                 params,
                 structure,
                 ReferenceFrames::forward_only(reference),
                 matrices,
+                missing,
             )?;
             require_full_coverage(
                 placed,

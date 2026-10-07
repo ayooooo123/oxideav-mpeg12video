@@ -685,6 +685,7 @@ pub fn decode_intra_picture_with_context(
 
     let mut frame = params.new_frame_buffer();
     let mb_width = params.mb_width() as u32;
+    let picture_macroblocks = params.mb_width() * params.mb_height();
     let slice_ctx = SliceContext::non_scalable(params.height as u32);
 
     let mut placed = 0usize;
@@ -722,7 +723,8 @@ pub fn decode_intra_picture_with_context(
             params.intra_dc_precision,
             params.q_scale_type,
         )
-        .with_quantiser_matrices(*matrices);
+        .with_quantiser_matrices(*matrices)
+        .with_picture_macroblocks(picture_macroblocks);
 
         let walk = crate::walk_slice_at(slice_buf, header.body_bit_position, ctx)?;
         for record in &walk.macroblocks {
@@ -733,6 +735,7 @@ pub fn decode_intra_picture_with_context(
                     > 0,
             );
         }
+        crate::slice_macroblock_walk::check_slice_coverage(placed, picture_macroblocks)?;
 
         offset = start + end;
     }

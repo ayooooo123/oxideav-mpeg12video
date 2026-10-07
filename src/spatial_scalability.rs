@@ -586,7 +586,8 @@ fn reconstruct_spatial_picture(
             geometry.q_scale_type,
         )
         .with_quantiser_matrices(*matrices)
-        .with_scalable_tables(table, index);
+        .with_scalable_tables(table, index)
+        .with_picture_macroblocks(mb_width as usize * mb_height);
         let walk = walk_slice_at(slice_buf, sh.body_bit_position, ctx)?;
         // Motion reconstruction for P / B pictures (spatial-only and
         // intra macroblocks reset the predictors through the same
@@ -729,6 +730,7 @@ fn reconstruct_spatial_picture(
                 }
             }
         }
+        crate::slice_macroblock_walk::check_slice_coverage(placed, mb_width as usize * mb_height)?;
     }
     if placed != mb_width as usize * mb_height {
         return Err(Error::InvalidBitstream(

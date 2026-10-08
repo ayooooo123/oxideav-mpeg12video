@@ -178,6 +178,42 @@ fn reset_then_seek_to_sequence_or_mid_gop_matches_independent_output() {
     }
 }
 
+/// A stream cut inside its last B-picture (as a file cut short is): FFmpeg
+/// conceals the B-picture's damage and shows it, then the anchor it held;
+/// here the B-picture is dropped, the decoder keeps going, and every other
+/// frame equals FFmpeg's, the held anchor included.
+#[test]
+fn damaged_b_picture_is_dropped_and_the_anchors_kept() {
+    let name = "mpeg2-ibbp-96x64.m2v";
+    let data = std::fs::read(fixture(name)).unwrap();
+    let b_pictures: Vec<usize> = data.windows(6).enumerate()
+        .filter(|(_, w)| w[..4] == [0, 0, 1, 0] && (w[5] >> 3) & 7 == 3).map(|(i, _)| i).collect();
+    let last_b = *b_pictures.last().unwrap();
+    let next = data[last_b + 4..].windows(4).position(|w| w[..3] == [0, 0, 1] && w[3] == 0).map_or(data.len(), |p| last_b + 4 + p);
+    assert_eq!(next, data.len(), "the last B-picture is the last picture");
+    let cut = &data[..last_b + (data.len() - last_b) / 2];
+    let path = std::env::temp_dir().join(format!("mpeg12-cut-b-{}.m2v", std::process::id()));
+    std::fs::write(&path, cut).unwrap();
+    let theirs = reference_path(&path, "yuv420p");
+    std::fs::remove_file(&path).unwrap();
+    let frame = 96 * 64 * 3 / 2;
+    let n = theirs.len() / frame;
+    // FFmpeg's frames without its concealed B-picture, shown before the
+    // last anchor.
+    let mut expected = theirs[..(n - 2) * frame].to_vec();
+    expected.extend_from_slice(&theirs[(n - 1) * frame..]);
+    let mut dec = decoder();
+    let mut actual = Vec::new();
+    for chunk in cut.chunks(997) {
+        dec.send_packet(&packet(chunk)).unwrap();
+        drain(&mut dec, &mut actual).unwrap();
+    }
+    dec.flush().unwrap();
+    drain(&mut dec, &mut actual).unwrap();
+    assert_eq!(actual.len() / frame, n - 1, "frames");
+    assert!(actual == expected, "every frame but the damaged B-picture equals FFmpeg's");
+}
+
 /// §6.2.3.2 quant_matrix_extension loading only a non-intra matrix, whose
 /// 64 values are transmitted in zigzag order.
 fn non_intra_matrix_extension(matrix: &[u8; 64]) -> Vec<u8> {

@@ -320,10 +320,18 @@ impl PictureDecoder {
         let forward = self.forward.as_ref().map(|f| &f.decoded.frame)
             .or(if closed_leading_b { backward } else { None });
         let mut frame_stamp = stamp;
+        // A B-picture is never a reference: when its reconstruction fails
+        // (FFmpeg conceals the damage and shows it), it is dropped and the
+        // anchors stay for the pictures after it, the held one included.
+        let b_picture = matches!(coding_type, PictureCodingType::Bidirectional);
         let (decoded, progressive_sequence) = match geometry {
             SequenceGeometry::Mpeg1(params) => {
                 let header = Mpeg2PictureHeader::parse(region)?;
-                (reconstruct_mpeg1_picture(region, &header, &params, forward, backward)?, true)
+                match reconstruct_mpeg1_picture(region, &header, &params, forward, backward) {
+                    Ok(decoded) => (decoded, true),
+                    Err(_) if b_picture => return Ok(None),
+                    Err(err) => return Err(err),
+                }
             }
             SequenceGeometry::Mpeg2(params, _) => {
                 let (header, ext) = Mpeg2PictureHeader::parse_with_extension(region)?;
@@ -331,7 +339,11 @@ impl PictureDecoder {
                     if self.pending_field.is_some() {
                         return Err(Error::InvalidBitstream("frame picture interrupts field pair"));
                     }
-                    reconstruct_picture(region, &header, &ext, params, forward, backward, &self.matrices)?
+                    match reconstruct_picture(region, &header, &ext, params, forward, backward, &self.matrices) {
+                        Ok(decoded) => decoded,
+                        Err(_) if b_picture => return Ok(None),
+                        Err(err) => return Err(err),
+                    }
                 } else {
                     // A field pair displays as one frame at its first field's time.
                     if self.pending_field.is_none() { self.field_stamp = stamp; }

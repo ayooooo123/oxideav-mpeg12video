@@ -300,6 +300,20 @@ the never-decoded older field is rejected, including the implicit zero-motion
 prediction of a macroblock without motion vectors, which reads the field of
 its own parity.
 
+MPEG-1/2 4:2:0 frame pictures use the attributed FFmpeg 2da55bf slice and
+reconstruction path, including its default error concealment. Damaged I/P/B
+pictures retain decoded macroblocks; missing motion/DC data is reconstructed
+from reference pictures or neighboring blocks, with damaged-edge smoothing.
+Concealment runs before the picture is displayed or becomes an anchor.
+FATE's truncated PVA sample gives all 37 pictures bit-exactly against
+FFmpeg `-idct simple`, including the final damaged B picture. The media
+integration also checks eight clean/damaged/truncated I/P/B TS cases and
+2000 fixed-seed slice mutations with bounded draining and reset.
+Field pictures and 4:2:2 / 4:4:4 retain their existing reconstruction path,
+without this concealment port; damaged B pictures on that path are dropped
+without losing the anchors. Arbitrary damaged inputs are bounded, not
+promised pixel-identical to FFmpeg's reusable frame-buffer contents.
+
 Timestamps follow ISO/IEC 13818-1 association: a packet's PTS/DTS belong to
 the first picture whose start code begins in it. The output chooses between
 the picture's own PTS and the DTS that released it, as FFmpeg's
@@ -318,10 +332,11 @@ time, as in FFmpeg.
 Compressed input is capped at 32 MiB, timestamp markers at 4096, and padded
 luma at 16 million pixels. Callers must drain after sending packets.
 Leading non-picture bytes retain only the three-byte start-code overlap.
-Slices cannot address macroblocks outside the picture grid, and a picture's
-slices stop at the first one that exceeds the grid, so slice work and
-retained macroblocks stay within twice the picture's macroblock count. MPEG-1
-D pictures, which have their own macroblock loop, are bounded the same way.
+Slices cannot reconstruct macroblocks outside the picture grid. The 4:2:0
+frame path also charges every macroblock attempt against a per-picture
+budget of twice the grid, including failed attempts and repeated slices.
+Other paths stop at the first slice exceeding the grid. MPEG-1 D pictures,
+which have their own macroblock loop, are bounded the same way.
 `output_video_dimensions` reports visible sequence dimensions before first
 output and exactly the last returned frame thereafter; `output_pixel_format`
 follows the same rule. Packed output excludes macroblock padding. Unique

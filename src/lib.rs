@@ -338,6 +338,7 @@
 //!   `state.reset_to_defaults(); ext.apply(&mut state, cf);
 //!   ctx.with_quantiser_matrices(state)` dance themselves.
 
+#![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 // The crate docs above deliberately link into `#[doc(hidden)]` internal
 // modules (the §6/§7 stage-by-stage build log); keep those links valid
@@ -395,6 +396,9 @@ pub mod frame_field_encoder;
 pub mod gop_header;
 #[doc(hidden)] // internal: §A 8x8 IDCT stage
 pub mod idct;
+mod error_resilience;
+mod ff_decode;
+mod ff_tables;
 mod simple_idct;
 mod streaming;
 pub mod inter_encoder;

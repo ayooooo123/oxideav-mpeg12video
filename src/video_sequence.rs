@@ -85,10 +85,7 @@ use crate::frame_assembly::{
     IntraPictureParams,
 };
 use crate::inter_reconstruction::ReferenceFrames;
-use crate::mpeg1_picture::{
-    decode_mpeg1_d_picture, decode_mpeg1_inter_picture, decode_mpeg1_intra_picture,
-    Mpeg1InterParams, Mpeg1PictureParams,
-};
+use crate::mpeg1_picture::{decode_mpeg1_d_picture, Mpeg1PictureParams};
 use crate::picture_header::{
     Mpeg2PictureHeader, PictureCodingExtension, PictureCodingType, PictureStructure,
 };
@@ -98,7 +95,8 @@ use crate::picture_reconstruction::{
     PicturePredictionParams,
 };
 use crate::quant_matrix_extension::{QuantMatrixExtension, QuantiserMatrixState};
-use crate::sequence_extension::Mpeg2Sequence;
+use crate::sequence_extension::{ChromaFormat, Mpeg2Sequence};
+use crate::ff_decode;
 use crate::{Error, Result};
 
 /// A reconstructed frame paired with its §6.3.10 `temporal_reference` —
@@ -321,16 +319,35 @@ impl PictureDecoder {
             .or(if closed_leading_b { backward } else { None });
         let mut frame_stamp = stamp;
         // A B-picture is never a reference: when its reconstruction fails
-        // (FFmpeg conceals the damage and shows it), it is dropped and the
-        // anchors stay for the pictures after it, the held one included.
+        // on the path without concealment, it is dropped and the anchors
+        // stay for the pictures after it, the held one included.
         let b_picture = matches!(coding_type, PictureCodingType::Bidirectional);
+        // decode_chunks failed after the picture started (ff_decode).
+        let mut abandoned = false;
         let (decoded, progressive_sequence) = match geometry {
             SequenceGeometry::Mpeg1(params) => {
                 let header = Mpeg2PictureHeader::parse(region)?;
-                match reconstruct_mpeg1_picture(region, &header, &params, forward, backward) {
-                    Ok(decoded) => (decoded, true),
-                    Err(_) if b_picture => return Ok(None),
-                    Err(err) => return Err(err),
+                if matches!(coding_type, PictureCodingType::DcIntra) {
+                    (reconstruct_mpeg1_d_picture(region, &header, &params)?, true)
+                } else {
+                    let fresh = FrameBuffer::new(params.width, params.height, ChromaFormat::Yuv420);
+                    let frame = match self.ff_frame(region, coding_type, mpeg1_pic(&header, &params), fresh)? {
+                        ff_decode::Decoded::Complete(frame) => frame,
+                        ff_decode::Decoded::Abandoned(frame) => {
+                            abandoned = true;
+                            frame
+                        }
+                        ff_decode::Decoded::NotStarted => return Ok(None),
+                    };
+                    let decoded = DecodedFrame {
+                        frame,
+                        temporal_reference: header.temporal_reference,
+                        picture_coding_type: header.picture_coding_type,
+                        top_field_first: false,
+                        repeat_first_field: false,
+                        progressive_frame: true,
+                    };
+                    (decoded, true)
                 }
             }
             SequenceGeometry::Mpeg2(params, _) => {
@@ -339,10 +356,30 @@ impl PictureDecoder {
                     if self.pending_field.is_some() {
                         return Err(Error::InvalidBitstream("frame picture interrupts field pair"));
                     }
-                    match reconstruct_picture(region, &header, &ext, params, forward, backward, &self.matrices) {
-                        Ok(decoded) => decoded,
-                        Err(_) if b_picture => return Ok(None),
-                        Err(err) => return Err(err),
+                    if params.chroma_format == ChromaFormat::Yuv420 {
+                        let pic = mpeg2_pic(&header, &ext, &params, &self.matrices);
+                        let frame = match self.ff_frame(region, coding_type, pic, params.new_frame_buffer())? {
+                            ff_decode::Decoded::Complete(frame) => frame,
+                            ff_decode::Decoded::Abandoned(frame) => {
+                                abandoned = true;
+                                frame
+                            }
+                            ff_decode::Decoded::NotStarted => return Ok(None),
+                        };
+                        DecodedFrame {
+                            frame,
+                            temporal_reference: header.temporal_reference,
+                            picture_coding_type: header.picture_coding_type,
+                            top_field_first: ext.top_field_first,
+                            repeat_first_field: ext.repeat_first_field,
+                            progressive_frame: ext.progressive_frame,
+                        }
+                    } else {
+                        match reconstruct_picture(region, &header, &ext, params, forward, backward, &self.matrices) {
+                            Ok(decoded) => decoded,
+                            Err(_) if b_picture => return Ok(None),
+                            Err(err) => return Err(err),
+                        }
                     }
                 } else {
                     // A field pair displays as one frame at its first field's time.
@@ -362,6 +399,16 @@ impl PictureDecoder {
         let duration = self.output.frame_rate.map(|(num, den)| (u64::from(fields) * u64::from(den), 2 * u64::from(num)));
         let release_dts = frame_stamp.decode_time();
         let frame = std::sync::Arc::new(OutputPicture { decoded, stamp: frame_stamp, duration });
+        if abandoned {
+            // FFmpeg shows nothing now. An I- or P-picture already is the
+            // newest anchor; the one it displaces is never shown, and it
+            // is shown in its turn.
+            if !b_picture {
+                self.forward = self.backward.replace(frame);
+                self.held = !self.output.low_delay;
+            }
+            return Ok(None);
+        }
         let output = match frame.decoded.picture_coding_type {
             PictureCodingType::Bidirectional | PictureCodingType::DcIntra => Some(frame),
             PictureCodingType::Intra | PictureCodingType::Predictive => {
@@ -395,6 +442,47 @@ impl PictureDecoder {
         self.backward = None;
         self.held = false;
         output.map(|picture| Released { picture, release_dts: None })
+    }
+
+    /// A 4:2:0 frame picture decoded as FFmpeg decodes it, damage
+    /// concealed ([`ff_decode`]), from FFmpeg's references
+    /// (ff_mpv_frame_start): an I- or P-picture's last_pic is the newest
+    /// anchor, a B-picture has both, and a closed GOP's leading B-picture
+    /// a gray dummy for the missing older one (ff_mpv_alloc_dummy_frames).
+    fn ff_frame(&self, region: &[u8], coding_type: PictureCodingType, pic: ff_decode::Pic<'_>, fresh: FrameBuffer) -> Result<ff_decode::Decoded> {
+        let fits = |f: &&FrameBuffer| f.y.width() == fresh.y.width() && f.y.height() == fresh.y.height();
+        let newest = self.backward.as_ref().map(|f| &f.decoded.frame).filter(fits);
+        let older = self.forward.as_ref().map(|f| &f.decoded.frame).filter(fits);
+        let gray;
+        let (last, next) = match coding_type {
+            PictureCodingType::Bidirectional => {
+                let next = newest.ok_or(Error::InvalidBitstream(
+                    "§6.1.1.11: B-picture before two I/P anchors exist (no backward reference)",
+                ))?;
+                let last = match older {
+                    Some(last) => last,
+                    None if self.closed_gop => {
+                        gray = gray_frame(&fresh);
+                        &gray
+                    }
+                    None => {
+                        return Err(Error::InvalidBitstream(
+                            "§6.1.1.11: B-picture before two I/P anchors exist (no forward reference)",
+                        ))
+                    }
+                };
+                (Some(last), Some(next))
+            }
+            PictureCodingType::Predictive => {
+                let last = newest.ok_or(Error::InvalidBitstream(
+                    "§6.1.1.11: P-picture before any I/P anchor exists (no forward reference)",
+                ))?;
+                (Some(last), None)
+            }
+            PictureCodingType::Intra | PictureCodingType::DcIntra => (newest, None),
+        };
+        let pic = ff_decode::Pic { last, next, ..pic };
+        ff_decode::decode_picture(&pic, &region[..ff_decode::parsed_frame_end(region)], fresh)
     }
 }
 
@@ -924,76 +1012,19 @@ fn reconstruct_picture(
     })
 }
 
-/// Reconstruct one ISO/IEC 11172-2 picture, dispatching on
-/// `picture_coding_type`. MPEG-1 pictures are always frame pictures;
-/// the motion-vector context (forward/backward f_code + full_pel
-/// flags) comes straight from the picture header (§2.4.3.4).
-fn reconstruct_mpeg1_picture(
+/// Reconstruct an ISO/IEC 11172-2 DC-only picture (Table B.2d and
+/// end_of_macroblock markers). I/P/B frame pictures use `ff_decode`.
+fn reconstruct_mpeg1_d_picture(
     picture_region: &[u8],
     header: &Mpeg2PictureHeader,
     params: &Mpeg1PictureParams,
-    forward_anchor: Option<&FrameBuffer>,
-    backward_anchor: Option<&FrameBuffer>,
 ) -> Result<DecodedFrame> {
-    let frame = match header.picture_coding_type {
-        PictureCodingType::Intra => {
-            let (frame, placed) = decode_mpeg1_intra_picture(picture_region, params)?;
-            require_full_coverage(
-                placed,
-                params.width.div_ceil(16),
-                params.height.div_ceil(16),
-            )?;
-            frame
-        }
-        PictureCodingType::DcIntra => {
-            // §2.4.3.4 dc intra-coded picture: DC-only intra blocks,
-            // Table B.2d macroblock type, end_of_macroblock markers.
-            let (frame, placed) = decode_mpeg1_d_picture(picture_region, params)?;
-            require_full_coverage(
-                placed,
-                params.width.div_ceil(16),
-                params.height.div_ceil(16),
-            )?;
-            frame
-        }
-        PictureCodingType::Predictive => {
-            let forward = backward_anchor.ok_or(Error::InvalidBitstream(
-                "§2.4.1: P-picture before any I/P anchor exists (no forward reference)",
-            ))?;
-            let inter = mpeg1_inter_params(header, params)?;
-            let (frame, placed) = decode_mpeg1_inter_picture(
-                picture_region,
-                &inter,
-                ReferenceFrames::forward_only(forward),
-            )?;
-            require_full_coverage(
-                placed,
-                params.width.div_ceil(16),
-                params.height.div_ceil(16),
-            )?;
-            frame
-        }
-        PictureCodingType::Bidirectional => {
-            let forward = forward_anchor.ok_or(Error::InvalidBitstream(
-                "§2.4.1: B-picture before two I/P anchors exist (no forward reference)",
-            ))?;
-            let backward = backward_anchor.ok_or(Error::InvalidBitstream(
-                "§2.4.1: B-picture before two I/P anchors exist (no backward reference)",
-            ))?;
-            let inter = mpeg1_inter_params(header, params)?;
-            let (frame, placed) = decode_mpeg1_inter_picture(
-                picture_region,
-                &inter,
-                ReferenceFrames::bidirectional(forward, backward),
-            )?;
-            require_full_coverage(
-                placed,
-                params.width.div_ceil(16),
-                params.height.div_ceil(16),
-            )?;
-            frame
-        }
-    };
+    let (frame, placed) = decode_mpeg1_d_picture(picture_region, params)?;
+    require_full_coverage(
+        placed,
+        params.width.div_ceil(16),
+        params.height.div_ceil(16),
+    )?;
 
     Ok(DecodedFrame {
         frame,
@@ -1006,36 +1037,6 @@ fn reconstruct_mpeg1_picture(
     })
 }
 
-/// Build the §2.4.4.2 / §2.4.4.3 motion context for an MPEG-1 P/B
-/// picture from its picture header.
-fn mpeg1_inter_params(
-    header: &Mpeg2PictureHeader,
-    params: &Mpeg1PictureParams,
-) -> Result<Mpeg1InterParams> {
-    let forward_f_code = header.fwd_f_code.ok_or(Error::InvalidBitstream(
-        "mpeg1 P/B picture header missing forward_f_code (§2.4.3.4)",
-    ))?;
-    let full_pel_forward_vector = header.full_pel_forward_vector.unwrap_or(false);
-    let (backward_f_code, full_pel_backward_vector) =
-        if header.picture_coding_type == PictureCodingType::Bidirectional {
-            (
-                header.bwd_f_code.ok_or(Error::InvalidBitstream(
-                    "mpeg1 B picture header missing backward_f_code (§2.4.3.4)",
-                ))?,
-                header.full_pel_backward_vector.unwrap_or(false),
-            )
-        } else {
-            (1, false)
-        };
-    Ok(Mpeg1InterParams {
-        base: *params,
-        picture_coding_type: header.picture_coding_type,
-        forward_f_code,
-        full_pel_forward_vector,
-        backward_f_code,
-        full_pel_backward_vector,
-    })
-}
 
 /// The first field of a §6.1.1.4.1 coded-frame pair, held until its
 /// partner field arrives so the two can be interleaved into one
@@ -1365,6 +1366,99 @@ fn inter_params(
         concealment_motion_vectors: ext.concealment_motion_vectors,
         top_field_first: ext.top_field_first,
     }
+}
+
+/// FFmpeg's pict_type.
+fn ff_pict_type(coding_type: PictureCodingType) -> u8 {
+    match coding_type {
+        PictureCodingType::Predictive => ff_decode::PICT_P,
+        PictureCodingType::Bidirectional => ff_decode::PICT_B,
+        PictureCodingType::Intra | PictureCodingType::DcIntra => ff_decode::PICT_I,
+    }
+}
+
+/// A weighting matrix in raster order, as FFmpeg keeps it for its C IDCT.
+fn raster(matrix: &[[u8; 8]; 8]) -> [u16; 64] {
+    std::array::from_fn(|i| u16::from(matrix[i / 8][i % 8]))
+}
+
+/// [`ff_decode`]'s view of an MPEG-2 frame picture. An f_code of 0 reads
+/// as 1 (mpeg_decode_picture_coding_extension).
+fn mpeg2_pic(
+    header: &Mpeg2PictureHeader,
+    ext: &PictureCodingExtension,
+    params: &IntraPictureParams,
+    matrices: &QuantiserMatrixState,
+) -> ff_decode::Pic<'static> {
+    let f = |code: u8| code.max(1);
+    ff_decode::Pic {
+        mpeg2: true,
+        pict_type: ff_pict_type(header.picture_coding_type),
+        f_code: [[f(ext.f_code_fwd_horiz), f(ext.f_code_fwd_vert)], [f(ext.f_code_bwd_horiz), f(ext.f_code_bwd_vert)]],
+        full_pel: [false; 2],
+        intra_dc_precision: ext.intra_dc_precision,
+        frame_pred_frame_dct: ext.frame_pred_frame_dct,
+        concealment_motion_vectors: ext.concealment_motion_vectors,
+        q_scale_type: ext.q_scale_type,
+        intra_vlc_format: ext.intra_vlc_format,
+        alternate_scan: ext.alternate_scan,
+        top_field_first: ext.top_field_first,
+        progressive_sequence: params.progressive_sequence,
+        height: params.height,
+        mb_width: params.mb_width(),
+        mb_height: params.mb_height(),
+        intra_matrix: raster(&matrices.intra_luma),
+        inter_matrix: raster(&matrices.non_intra_luma),
+        // QuantiserMatrixState keeps 4:2:0's shared weights in the luma
+        // slots; its separate chroma slots serve only 4:2:2 / 4:4:4.
+        chroma_intra_matrix: raster(&matrices.intra_luma),
+        chroma_inter_matrix: raster(&matrices.non_intra_luma),
+        last: None,
+        next: None,
+    }
+}
+
+/// [`ff_decode`]'s view of an MPEG-1 picture. An f_code of 0 reads as 1
+/// (mpeg1_decode_picture) and the intra DC weight is always 8
+/// (load_matrix).
+fn mpeg1_pic(header: &Mpeg2PictureHeader, params: &Mpeg1PictureParams) -> ff_decode::Pic<'static> {
+    let f = |code: Option<u8>| code.unwrap_or(1).max(1);
+    let mut intra = raster(&params.intra_quant);
+    intra[0] = 8;
+    let inter = raster(&params.non_intra_quant);
+    ff_decode::Pic {
+        mpeg2: false,
+        pict_type: ff_pict_type(header.picture_coding_type),
+        f_code: [[f(header.fwd_f_code); 2], [f(header.bwd_f_code); 2]],
+        full_pel: [header.full_pel_forward_vector.unwrap_or(false), header.full_pel_backward_vector.unwrap_or(false)],
+        intra_dc_precision: 0,
+        frame_pred_frame_dct: true,
+        concealment_motion_vectors: false,
+        q_scale_type: false,
+        intra_vlc_format: false,
+        alternate_scan: false,
+        top_field_first: false,
+        progressive_sequence: true,
+        height: params.height,
+        mb_width: params.mb_width(),
+        mb_height: params.mb_height(),
+        intra_matrix: intra,
+        inter_matrix: inter,
+        chroma_intra_matrix: intra,
+        chroma_inter_matrix: inter,
+        last: None,
+        next: None,
+    }
+}
+
+/// The dummy FFmpeg gives a picture without its forward reference:
+/// color_frame's 0x80 in every plane.
+fn gray_frame(like: &FrameBuffer) -> FrameBuffer {
+    let mut gray = like.clone();
+    for plane in [&mut gray.y, &mut gray.cb, &mut gray.cr] {
+        plane.samples_mut().fill(0x80);
+    }
+    gray
 }
 
 

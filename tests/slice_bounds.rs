@@ -113,31 +113,37 @@ fn intra_picture_16x16(mpeg1: bool, slices: &[usize]) -> Vec<u8> {
     stream
 }
 
-fn decode(mpeg1: bool, stream: Vec<u8>) -> (bool, usize, usize) {
+fn decode(mpeg1: bool, stream: Vec<u8>) -> (oxideav_core::Result<oxideav_core::Frame>, usize, usize) {
     let mut dec = Mpeg12Decoder::new(CodecId::new(if mpeg1 { "mpeg1video" } else { "mpeg2video" }));
     dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), stream)).unwrap();
     dec.flush().unwrap();
     let (result, peak, total) = measured(|| dec.receive_frame());
-    (result.is_err(), peak, total)
+    (result, peak, total)
 }
 
 #[test]
 fn a_slice_cannot_expand_past_the_picture_grid() {
     for mpeg1 in [false, true] {
         // A legal picture is one macroblock; the slice carries 100,000.
-        let (rejected, peak, _) = decode(mpeg1, intra_picture_16x16(mpeg1, &[100_000]));
-        assert!(rejected, "mpeg1={mpeg1}: out-of-picture macroblocks must be rejected");
-        // Rejection at the second macroblock retains one decoded macroblock.
-        assert!(peak < 1 << 20, "mpeg1={mpeg1}: peak {peak} bytes while rejecting");
+        let (result, peak, _) = decode(mpeg1, intra_picture_16x16(mpeg1, &[100_000]));
+        let oxideav_core::Frame::Video(frame) = result.unwrap() else { panic!("video") };
+        assert_eq!(frame.planes.len(), 3);
+        for (plane, length) in frame.planes.iter().zip([256, 64, 64]) {
+            assert_eq!(plane.data.len(), length);
+        }
+        assert!(frame.planes.iter().all(|p| p.data.iter().all(|&v| v == 128)), "mpeg1={mpeg1}");
+        // Extra macroblocks are not reconstructed; the one-picture result
+        // survives concealment without expanding the retained working set.
+        assert!(peak < 1 << 20, "mpeg1={mpeg1}: peak {peak} bytes");
     }
 }
 
 #[test]
 fn repeated_slices_cannot_decode_the_picture_again_and_again() {
     for mpeg1 in [false, true] {
-        let (rejected, _, total) = decode(mpeg1, intra_picture_16x16(mpeg1, &vec![1; 100_000]));
-        assert!(rejected, "mpeg1={mpeg1}: duplicate coverage must be rejected");
-        // Work stops at the first slice that exceeds the grid.
+        let (result, _, total) = decode(mpeg1, intra_picture_16x16(mpeg1, &vec![1; 100_000]));
+        assert!(result.is_err(), "mpeg1={mpeg1}: duplicate coverage must be bounded");
+        // At most twice the picture grid may be attempted across all slices.
         assert!(total < 8 << 20, "mpeg1={mpeg1}: {total} bytes allocated across slices");
     }
 }

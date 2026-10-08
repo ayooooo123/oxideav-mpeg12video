@@ -178,12 +178,9 @@ fn reset_then_seek_to_sequence_or_mid_gop_matches_independent_output() {
     }
 }
 
-/// A stream cut inside its last B-picture (as a file cut short is): FFmpeg
-/// conceals the B-picture's damage and shows it, then the anchor it held;
-/// here the B-picture is dropped, the decoder keeps going, and every other
-/// frame equals FFmpeg's, the held anchor included.
+/// A cut last B-picture is concealed, then the held anchor is released.
 #[test]
-fn damaged_b_picture_is_dropped_and_the_anchors_kept() {
+fn damaged_b_picture_is_concealed_and_the_anchors_kept() {
     let name = "mpeg2-ibbp-96x64.m2v";
     let data = std::fs::read(fixture(name)).unwrap();
     let b_pictures: Vec<usize> = data.windows(6).enumerate()
@@ -198,10 +195,7 @@ fn damaged_b_picture_is_dropped_and_the_anchors_kept() {
     std::fs::remove_file(&path).unwrap();
     let frame = 96 * 64 * 3 / 2;
     let n = theirs.len() / frame;
-    // FFmpeg's frames without its concealed B-picture, shown before the
-    // last anchor.
-    let mut expected = theirs[..(n - 2) * frame].to_vec();
-    expected.extend_from_slice(&theirs[(n - 1) * frame..]);
+    assert_eq!(n, 30, "FFmpeg retains the damaged B-picture");
     let mut dec = decoder();
     let mut actual = Vec::new();
     for chunk in cut.chunks(997) {
@@ -210,8 +204,8 @@ fn damaged_b_picture_is_dropped_and_the_anchors_kept() {
     }
     dec.flush().unwrap();
     drain(&mut dec, &mut actual).unwrap();
-    assert_eq!(actual.len() / frame, n - 1, "frames");
-    assert!(actual == expected, "every frame but the damaged B-picture equals FFmpeg's");
+    assert_eq!(actual.len() / frame, n, "frames");
+    assert!(actual == theirs, "every frame, including the concealed B-picture, equals FFmpeg's");
 }
 
 /// §6.2.3.2 quant_matrix_extension loading only a non-intra matrix, whose

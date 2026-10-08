@@ -84,6 +84,11 @@ impl Plane {
         &self.samples
     }
 
+    /// Row-major samples to write, stride [`Self::width`].
+    pub(crate) fn samples_mut(&mut self) -> &mut [u8] {
+        &mut self.samples
+    }
+
     /// Copy the top-left `rect_width × rect_height` rectangle out of
     /// the plane as a tightly-packed row-major buffer (stride ==
     /// `rect_width`). The rectangle is clipped to the plane extent.

@@ -8,10 +8,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed — PearTube streaming fork
 
-- A B-picture whose reconstruction fails is dropped and both anchors kept:
-  FFmpeg conceals a damaged B-picture and keeps decoding, so a cut-off or
-  damaged B-picture no longer stops the stream until a reset, nor loses the
-  anchor held for display at the end.
+- Conceal damaged MPEG-1/2 4:2:0 I/P/B frame pictures rather than dropping
+  damaged B pictures. The attributed FFmpeg 2da55bf slice, reconstruction and
+  error-resilience ports retain decoded macroblocks, repair missing prediction
+  and DC values, and smooth damaged edges before output/reference rotation.
+- Map MPEG-2 4:2:0 chroma to the shared downloaded luma quantizer matrices.
+  FATE PVA retains all 37 pictures exactly against FFmpeg `-idct simple`,
+  including its cut-off B picture; damaged I/P/B TS pictures also match.
+- Bound macroblock attempts across repeated slices to twice the picture grid.
+  An overlong individual slice cannot expand the reconstructed picture;
+  repeated coverage exceeding the work budget is rejected.
 - Decode and reorder pictures during packet draining instead of retaining the
   whole elementary stream until flush. Bound compressed input, timestamps and
   picture geometry; reset all state and preserve incomplete-field EOF behavior.

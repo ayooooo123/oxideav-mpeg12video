@@ -1,6 +1,6 @@
 //! Robustness of the runtime MPEG-1 / MPEG-2 video [`Decoder`] against
 //! malformed input: truncated and corrupted elementary streams must
-//! produce a clean error (or empty output), never a panic. A decoder is
+//! produce concealed output or a clean error, never a panic. A decoder is
 //! fed attacker-controlled container payloads, so a bounds-check slip or
 //! an arithmetic overflow anywhere in the parse / reconstruct path is a
 //! denial-of-service bug, not a cosmetic one.
@@ -132,17 +132,15 @@ fn zero_slice_pictures_are_rejected_not_allocated() {
     assert!(result.is_err(), "slice-less pictures must be rejected");
 }
 
-/// A conformant picture with its last slice removed leaves the bottom
-/// macroblock row uncovered — rejected per §6.1.2.2 (restricted slice
-/// structure), while the intact stream decodes.
+/// A missing final macroblock row is concealed, including in the whole-stream
+/// API; the retained picture must match FFmpeg rather than being dropped.
 #[test]
-fn partial_slice_coverage_is_rejected() {
+fn partial_slice_coverage_is_concealed() {
     let stream = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/selfenc/selfenc-intra-64x48.m2v"
     ))
     .expect("fixture");
-    assert!(oxideav_mpeg12video::decode_video_sequence(&stream).is_ok());
     // Locate the last slice start code (0x000001 0x01..=0xAF) and cut
     // the stream there, re-appending the sequence_end_code.
     let last_slice = stream
@@ -154,8 +152,18 @@ fn partial_slice_coverage_is_rejected() {
         .expect("slice present");
     let mut cut = stream[..last_slice].to_vec();
     cut.extend_from_slice(&[0, 0, 1, 0xB7]);
-    assert!(
-        oxideav_mpeg12video::decode_video_sequence(&cut).is_err(),
-        "a picture missing a slice row must be rejected"
-    );
+    let frames = oxideav_mpeg12video::decode_video_sequence(&cut).unwrap();
+    let actual: Vec<u8> = frames.iter().flat_map(|picture| {
+        [&picture.frame.y, &picture.frame.cb, &picture.frame.cr]
+            .into_iter().flat_map(|plane| plane.samples().iter().copied())
+    }).collect();
+    let path = std::env::temp_dir().join(format!("mpeg12-missing-row-{}.m2v", std::process::id()));
+    std::fs::write(&path, &cut).unwrap();
+    let oracle = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-idct", "simple", "-i"]).arg(&path)
+        .args(["-map", "0:v:0", "-fps_mode", "passthrough", "-pix_fmt", "yuv420p", "-f", "rawvideo", "-"])
+        .output().expect("FFmpeg oracle");
+    assert!(oracle.status.success(), "{}", String::from_utf8_lossy(&oracle.stderr));
+    assert_eq!(actual, oracle.stdout, "the concealed final row must match the oracle");
+    std::fs::remove_file(path).unwrap();
 }

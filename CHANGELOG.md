@@ -8,6 +8,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed — PearTube streaming fork
 
+- A B-picture whose reconstruction fails is dropped and both anchors kept:
+  FFmpeg conceals a damaged B-picture and keeps decoding, so a cut-off or
+  damaged B-picture no longer stops the stream until a reset, nor loses the
+  anchor held for display at the end.
 - Decode and reorder pictures during packet draining instead of retaining the
   whole elementary stream until flush. Bound compressed input, timestamps and
   picture geometry; reset all state and preserve incomplete-field EOF behavior.

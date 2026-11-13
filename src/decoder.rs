@@ -30,10 +30,11 @@ pub struct Mpeg12Decoder {
     last_output: Option<(u32, u32, PixelFormat)>,
     clock: PresentationClock,
     failed: bool,
+    exec_ctx: oxideav_core::ExecutionContext,
 }
 impl Mpeg12Decoder {
     pub fn new(codec_id: CodecId) -> Self {
-        Self { codec_id, stream: StreamDecoder::random_access(), last_output: None, clock: PresentationClock::default(), failed: false }
+        Self { codec_id, stream: StreamDecoder::random_access(), last_output: None, clock: PresentationClock::default(), failed: false, exec_ctx: oxideav_core::ExecutionContext::serial() }
     }
     fn output_layout(&self) -> Option<(u32, u32, PixelFormat)> {
         self.last_output.or_else(|| self.stream.dimensions().map(|(w,h,c)| (w as u32,h as u32,pixel_format(c))))
@@ -47,12 +48,16 @@ impl Mpeg12Decoder {
 }
 impl Decoder for Mpeg12Decoder {
     fn codec_id(&self) -> &CodecId { &self.codec_id }
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.exec_ctx = ctx.clone();
+    }
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         if self.failed { return Err(Error::invalid("mpeg12video: reset required after decode error")); }
         self.clock.set_time_base(packet.time_base);
         self.stream.push(&packet.data, Stamp { pts: packet.pts, dts: packet.dts }).map_err(|err| self.fail(err))
     }
     fn receive_frame(&mut self) -> Result<Frame> {
+        self.stream.set_execution_context(&self.exec_ctx);
         if self.failed { return Err(Error::invalid("mpeg12video: reset required after decode error")); }
         let Some(released) = self.stream.next().map_err(|err| self.fail(err))? else {
             return Err(if self.stream.is_drained() { Error::Eof } else { Error::NeedMore });

@@ -338,7 +338,7 @@
 //!   `state.reset_to_defaults(); ext.apply(&mut state, cf);
 //!   ctx.with_quantiser_matrices(state)` dance themselves.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 // The crate docs above deliberately link into `#[doc(hidden)]` internal
 // modules (the §6/§7 stage-by-stage build log); keep those links valid
@@ -400,6 +400,9 @@ mod error_resilience;
 mod ff_decode;
 mod ff_tables;
 mod simple_idct;
+#[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+#[allow(unsafe_code)]
+mod simd;
 mod streaming;
 pub mod inter_encoder;
 pub mod inter_reconstruction;

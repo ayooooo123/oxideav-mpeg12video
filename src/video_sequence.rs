@@ -249,9 +249,14 @@ pub(crate) struct PictureDecoder {
     closed_gop: bool,
     /// Input may begin at any picture rather than at a sequence start.
     random_access: bool,
+    exec_ctx: oxideav_core::ExecutionContext,
 }
 
 impl PictureDecoder {
+    pub(crate) fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.exec_ctx = ctx.clone();
+    }
+
     pub(crate) fn random_access() -> Self {
         Self { random_access: true, ..Self::default() }
     }
@@ -482,7 +487,7 @@ impl PictureDecoder {
             PictureCodingType::Intra | PictureCodingType::DcIntra => (newest, None),
         };
         let pic = ff_decode::Pic { last, next, ..pic };
-        ff_decode::decode_picture(&pic, &region[..ff_decode::parsed_frame_end(region)], fresh)
+        ff_decode::decode_picture(&pic, &region[..ff_decode::parsed_frame_end(region)], fresh, &self.exec_ctx)
     }
 }
 

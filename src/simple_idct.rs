@@ -65,6 +65,7 @@ fn idct_row_cond_dc(row: &mut [i16]) {
 
 /// `IDCT_COLS` of the template: returns the eight column outputs (after
 /// the final shift), in output row order.
+#[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
 fn idct_cols(b: &[i16], c: usize) -> [i32; 8] {
     let col = |r: usize| b[8 * r + c] as i32;
     let mut a0 = m(W4, col(0).wrapping_add((1 << (COL_SHIFT - 1)) / W4));
@@ -120,15 +121,27 @@ fn idct_cols(b: &[i16], c: usize) -> [i32; 8] {
 }
 
 pub(crate) fn idct(input: &[[i16; 8]; 8]) -> [[i16; 8]; 8] {
+    if input.iter().flatten().skip(1).all(|&v| v == 0) {
+        let dc = ((i32::from(input[0][0]) << DC_SHIFT) as i16) as i32;
+        let value = (m(W4, dc.wrapping_add(32)) >> COL_SHIFT).clamp(-256, 255) as i16;
+        return [[value; 8]; 8];
+    }
     let mut block = [0i16; 64];
     for (row, source) in block.chunks_exact_mut(8).zip(input) {
         row.copy_from_slice(source);
         idct_row_cond_dc(row);
     }
-    let mut output = [[0i16; 8]; 8];
-    for c in 0..8 {
-        let values = idct_cols(&block, c);
-        for r in 0..8 { output[r][c] = values[r].clamp(-256, 255) as i16; }
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+    {
+        crate::simd::columns(&block).map(|row| row.map(|v| v.clamp(-256, 255) as i16))
     }
-    output
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
+    {
+        let mut output = [[0i16; 8]; 8];
+        for c in 0..8 {
+            let values = idct_cols(&block, c);
+            for r in 0..8 { output[r][c] = values[r].clamp(-256, 255) as i16; }
+        }
+        output
+    }
 }

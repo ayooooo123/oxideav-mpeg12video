@@ -113,6 +113,7 @@ impl Mpeg2SequenceHeader {
     /// On success the returned struct mirrors the lower-bit values
     /// from the bitstream; higher-level synthesis (combining with
     /// `sequence_extension()`) is the caller's responsibility.
+    #[cold]
     pub fn parse(buf: &[u8]) -> Result<Self> {
         let mut br = BitReader::new(buf);
 

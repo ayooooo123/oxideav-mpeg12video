@@ -29,6 +29,10 @@ impl StreamDecoder {
         Self { pictures: PictureDecoder::random_access(), ..Self::default() }
     }
 
+    pub(crate) fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.pictures.set_execution_context(ctx);
+    }
+
     pub(crate) fn dimensions(&self) -> Option<(usize, usize, ChromaFormat)> {
         self.initial_geometry
     }

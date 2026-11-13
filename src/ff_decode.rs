@@ -374,6 +374,29 @@ pub(crate) struct Cur {
     pub mb_type: Vec<u32>,
 }
 
+struct FrameView<'a> {
+    y: &'a mut [u8],
+    cb: &'a mut [u8],
+    cr: &'a mut [u8],
+    linesize: usize,
+    uvlinesize: usize,
+    row: usize,
+}
+
+impl FrameView<'_> {
+    fn new(fb: &mut FrameBuffer) -> FrameView<'_> {
+        let (linesize, uvlinesize) = (fb.y.width(), fb.cb.width());
+        FrameView { y: fb.y.samples_mut(), cb: fb.cb.samples_mut(), cr: fb.cr.samples_mut(), linesize, uvlinesize, row: 0 }
+    }
+}
+
+struct CurView<'a> {
+    fb: FrameView<'a>,
+    mb_type: &'a mut [u32],
+    mb_base: usize,
+    row_end: usize,
+}
+
 /// Where FFmpeg's mpegvideo parser ends a frame picture's packet
 /// (ff_mpeg1_find_frame_end): at the first start code after its first
 /// slice that is not a slice's, a sequence end code included.
@@ -393,12 +416,23 @@ pub(crate) fn parsed_frame_end(region: &[u8]) -> usize {
 
 /// decode_chunks over one picture: `packet` runs from its picture start
 /// code to where the parser ends it ([`parsed_frame_end`]).
-pub(crate) fn decode_picture(pic: &Pic, packet: &[u8], fresh: FrameBuffer) -> Result<Decoded, crate::Error> {
+pub(crate) fn decode_picture(pic: &Pic, packet: &[u8], fresh: FrameBuffer, ctx: &oxideav_core::ExecutionContext) -> Result<Decoded, crate::Error> {
+    #[cfg(target_arch = "wasm32")]
+    let _ = ctx;
     let mb_stride = pic.mb_stride();
     // mbskip_table: concealment reads only what this picture wrote.
     let mut mbskip = vec![0u8; mb_stride * pic.mb_height];
     let mut cur = Cur { fb: fresh, mb_type: vec![0; mb_stride * pic.mb_height] };
     let mut er = Er::new(pic.mb_width, pic.mb_height);
+    #[cfg(not(target_arch = "wasm32"))]
+    if ctx.effective_workers(pic.mb_height) > 1 && parallel_rows(pic, packet, &mut cur, &mut mbskip, ctx) {
+        er.frame_start();
+        for row in 0..pic.mb_height {
+            er.add_slice(0, row as i32, -1, row as i32 + 1, ER_AC_END | ER_DC_END | ER_MV_END);
+        }
+        error_resilience::frame_end(&mut er, pic, &mut cur, &mbskip);
+        return Ok(Decoded::Complete(cur.fb));
+    }
     let mut slice = SliceState {
         macroblocks_left: 2 * pic.mb_width * pic.mb_height,
         ..SliceState::default()
@@ -429,7 +463,8 @@ pub(crate) fn decode_picture(pic: &Pic, packet: &[u8], fresh: FrameBuffer) -> Re
             er.frame_start();
         }
         let mut gb = Gb::new(&packet[p..]);
-        match slice.decode_slice(pic, &mut gb, mb_y, &mut cur, &mut mbskip) {
+        let mut view = CurView { fb: FrameView::new(&mut cur.fb), mb_type: &mut cur.mb_type, mb_base: 0, row_end: pic.mb_height };
+        match slice.decode_slice(pic, &mut gb, mb_y, &mut view, &mut mbskip) {
             Ok(()) => {
                 er.add_slice(slice.resync_mb_x, slice.resync_mb_y, slice.mb_x as i32 - 1, slice.mb_y as i32, ER_AC_END | ER_DC_END | ER_MV_END);
                 p += (gb.count() - 1) / 8;
@@ -449,6 +484,68 @@ pub(crate) fn decode_picture(pic: &Pic, packet: &[u8], fresh: FrameBuffer) -> Re
     }
     error_resilience::frame_end(&mut er, pic, &mut cur, &mbskip);
     Ok(Decoded::Complete(cur.fb))
+}
+
+/// Only complete, independent, ordered slice rows take the parallel path.
+/// Failed/overlapping rows restore the zero-initialized picture before serial
+/// decoding, preserving the existing damaged-stream concealment behaviour.
+#[cfg(not(target_arch = "wasm32"))]
+fn parallel_rows(pic: &Pic, packet: &[u8], cur: &mut Cur, mbskip: &mut [u8], ctx: &oxideav_core::ExecutionContext) -> bool {
+    let mut starts = Vec::with_capacity(pic.mb_height);
+    let mut p = 0;
+    loop {
+        let (q, code) = find_start_code(packet, p);
+        let Some(code) = code else { break };
+        p = q;
+        if !(0x101..=0x1AF).contains(&code) { continue; }
+        let mut row = (code - 0x101) as usize;
+        if pic.mpeg2 && pic.mb_height > 2800 / 16 {
+            row += usize::from(packet.get(p).copied().unwrap_or(0) & 0xE0) << 2;
+        }
+        if row != starts.len() || packet.len() - p < 2 { return false; }
+        starts.push(p);
+    }
+    if starts.len() != pic.mb_height || starts.len() < 2
+        || pic.mb_width * pic.mb_height * 11 / (33 * 2 * 8) > packet.len() { return false; }
+    let workers = ctx.effective_workers(starts.len());
+    let rows_per_worker = starts.len().div_ceil(workers);
+    let (ys, cs, ms) = (cur.fb.y.width(), cur.fb.cb.width(), pic.mb_stride());
+    let ok = std::thread::scope(|scope| {
+        let bands = cur.fb.y.samples_mut().chunks_mut(ys * 16 * rows_per_worker)
+            .zip(cur.fb.cb.samples_mut().chunks_mut(cs * 8 * rows_per_worker))
+            .zip(cur.fb.cr.samples_mut().chunks_mut(cs * 8 * rows_per_worker))
+            .zip(cur.mb_type.chunks_mut(ms * rows_per_worker))
+            .zip(mbskip.chunks_mut(ms * rows_per_worker))
+            .zip(starts.chunks(rows_per_worker));
+        let mut handles = Vec::with_capacity(workers);
+        for (band, (((((y, cb), cr), mb_type), skip), offsets)) in bands.enumerate() {
+            let first = band * rows_per_worker;
+            handles.push(scope.spawn(move || {
+                let mut view = CurView { fb: FrameView { y, cb, cr, linesize: ys, uvlinesize: cs, row: first },
+                    mb_type, mb_base: first * ms, row_end: first };
+                for (i, &offset) in offsets.iter().enumerate() {
+                    let row = first + i;
+                    view.row_end = row + 1;
+                    let mut state = SliceState { macroblocks_left: pic.mb_width * 2, ..SliceState::default() };
+                    let mut gb = Gb::new(&packet[offset..]);
+                    if state.decode_slice(pic, &mut gb, row, &mut view, skip).is_err()
+                        || state.resync_mb_x != 0 || state.mb_x != 0 || state.mb_y != row + 1 {
+                        return false;
+                    }
+                }
+                true
+            }));
+        }
+        handles.into_iter().fold(true, |ok, handle| handle.join().unwrap_or(false) && ok)
+    });
+    if !ok {
+        cur.fb.y.samples_mut().fill(0);
+        cur.fb.cb.samples_mut().fill(0);
+        cur.fb.cr.samples_mut().fill(0);
+        cur.mb_type.fill(0);
+        mbskip.fill(0);
+    }
+    ok
 }
 
 // ───────────────────────── slices ─────────────────────────
@@ -543,7 +640,7 @@ impl SliceState {
     }
 
     /// mpeg_decode_slice for a frame picture.
-    fn decode_slice(&mut self, pic: &Pic, gb: &mut Gb, mb_y: usize, cur: &mut Cur, mbskip: &mut [u8]) -> Result<(), ()> {
+    fn decode_slice(&mut self, pic: &Pic, gb: &mut Gb, mb_y: usize, cur: &mut CurView, mbskip: &mut [u8]) -> Result<(), ()> {
         self.resync_mb_x = -1;
         self.resync_mb_y = -1;
         if pic.mpeg2 && pic.mb_height > 2800 / 16 {
@@ -583,6 +680,7 @@ impl SliceState {
 
         let mut mb_skip_run: i32 = 0;
         loop {
+            if self.mb_y >= cur.row_end { return Err(()); }
             let Some(left) = self.macroblocks_left.checked_sub(1) else {
                 self.exceeded_work = true;
                 return Err(());
@@ -676,9 +774,9 @@ impl SliceState {
     }
 
     /// mpeg_decode_mb.
-    fn decode_mb(&mut self, pic: &Pic, gb: &mut Gb, mb_skip_run: &mut i32, cur: &mut Cur) -> Result<(), ()> {
+    fn decode_mb(&mut self, pic: &Pic, gb: &mut Gb, mb_skip_run: &mut i32, cur: &mut CurView) -> Result<(), ()> {
         let mb_stride = pic.mb_stride();
-        let mb_xy = self.mb_x + self.mb_y * mb_stride;
+        let mb_xy = self.mb_x + self.mb_y * mb_stride - cur.mb_base;
         let run = *mb_skip_run;
         *mb_skip_run -= 1;
         if run != 0 {
@@ -687,7 +785,7 @@ impl SliceState {
                 cur.mb_type[mb_xy] = MB_TYPE_SKIP | MB_TYPE_FORWARD_MV | MB_TYPE_16X16;
             } else {
                 // A skip run reaches a row start only from the row above.
-                let previous = if self.mb_x > 0 { mb_xy - 1 } else { pic.mb_width + (self.mb_y - 1) * mb_stride - 1 };
+                let previous = if self.mb_x > 0 { mb_xy - 1 } else { pic.mb_width + (self.mb_y - 1) * mb_stride - 1 - cur.mb_base };
                 let mb_type = cur.mb_type[previous];
                 if is_intra(mb_type) {
                     return Err(()); // skip with previntra
@@ -1116,16 +1214,16 @@ pub(crate) struct MbPrediction<'m> {
 }
 
 /// ff_mpv_reconstruct_mb for the decoded macroblock at the slice position.
-fn reconstruct_mb(s: &mut SliceState, pic: &Pic, cur: &mut Cur, mbskip: &mut [u8]) {
+fn reconstruct_mb(s: &mut SliceState, pic: &Pic, cur: &mut CurView, mbskip: &mut [u8]) {
     let (mb_x, mb_y) = (s.mb_x, s.mb_y);
     // mbskip_table: a skipped macroblock, or any of a picture that is
     // not a reference.
-    mbskip[mb_x + mb_y * pic.mb_stride()] = u8::from(s.mb_skipped || pic.pict_type == PICT_B);
+    mbskip[mb_x + mb_y * pic.mb_stride() - cur.mb_base] = u8::from(s.mb_skipped || pic.pict_type == PICT_B);
     s.mb_skipped = false;
-    let linesize = cur.fb.y.width();
-    let uvlinesize = cur.fb.cb.width();
-    let dest_y = mb_y * 16 * linesize + mb_x * 16;
-    let dest_c = mb_y * 8 * uvlinesize + mb_x * 8;
+    let linesize = cur.fb.linesize;
+    let uvlinesize = cur.fb.uvlinesize;
+    let dest_y = (mb_y - cur.fb.row) * 16 * linesize + mb_x * 16;
+    let dest_c = (mb_y - cur.fb.row) * 8 * uvlinesize + mb_x * 8;
     let (dct_linesize, dct_offset) = if s.interlaced_dct { (linesize * 2, linesize) } else { (linesize, linesize * 8) };
     let luma = [dest_y, dest_y + 8, dest_y + dct_offset, dest_y + dct_offset + 8];
     if !s.mb_intra {
@@ -1135,24 +1233,24 @@ fn reconstruct_mb(s: &mut SliceState, pic: &Pic, cur: &mut Cur, mbskip: &mut [u8
             mv: &s.mv,
             field_select: &s.field_select,
         };
-        motion(pic, &mut cur.fb, mb_x, mb_y, &prediction);
+        motion_view(pic, &mut cur.fb, mb_x, mb_y, &prediction);
         for (i, &d) in luma.iter().enumerate() {
             if s.block_last_index[i] >= 0 {
-                idct_add(cur.fb.y.samples_mut(), d, dct_linesize, &s.block[i]);
+                idct_add(cur.fb.y, d, dct_linesize, &s.block[i]);
             }
         }
         if s.block_last_index[4] >= 0 {
-            idct_add(cur.fb.cb.samples_mut(), dest_c, uvlinesize, &s.block[4]);
+            idct_add(cur.fb.cb, dest_c, uvlinesize, &s.block[4]);
         }
         if s.block_last_index[5] >= 0 {
-            idct_add(cur.fb.cr.samples_mut(), dest_c, uvlinesize, &s.block[5]);
+            idct_add(cur.fb.cr, dest_c, uvlinesize, &s.block[5]);
         }
     } else {
         for (i, &d) in luma.iter().enumerate() {
-            idct_put(cur.fb.y.samples_mut(), d, dct_linesize, &s.block[i]);
+            idct_put(cur.fb.y, d, dct_linesize, &s.block[i]);
         }
-        idct_put(cur.fb.cb.samples_mut(), dest_c, uvlinesize, &s.block[4]);
-        idct_put(cur.fb.cr.samples_mut(), dest_c, uvlinesize, &s.block[5]);
+        idct_put(cur.fb.cb, dest_c, uvlinesize, &s.block[4]);
+        idct_put(cur.fb.cr, dest_c, uvlinesize, &s.block[5]);
     }
 }
 
@@ -1170,6 +1268,9 @@ fn idct_put(dst: &mut [u8], at: usize, stride: usize, block: &[i16; 64]) {
     for (r, row) in out.iter().enumerate() {
         let o = at + r * stride;
         if let Some(d) = dst.get_mut(o..o + 8) {
+            #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+            crate::simd::residual(d, row, false);
+            #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
             for (p, &v) in d.iter_mut().zip(row) {
                 *p = v.clamp(0, 255) as u8;
             }
@@ -1179,10 +1280,14 @@ fn idct_put(dst: &mut [u8], at: usize, stride: usize, block: &[i16; 64]) {
 
 /// idct_add: the transform added to the prediction, clipped.
 fn idct_add(dst: &mut [u8], at: usize, stride: usize, block: &[i16; 64]) {
+    if block.iter().all(|&v| v == 0) { return; }
     let out = idct8(block);
     for (r, row) in out.iter().enumerate() {
         let o = at + r * stride;
         if let Some(d) = dst.get_mut(o..o + 8) {
+            #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+            crate::simd::residual(d, row, true);
+            #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
             for (p, &v) in d.iter_mut().zip(row) {
                 *p = (i32::from(*p) + i32::from(v)).clamp(0, 255) as u8;
             }
@@ -1193,6 +1298,10 @@ fn idct_add(dst: &mut [u8], at: usize, stride: usize, block: &[i16; 64]) {
 /// The forward and backward predictions of a macroblock (put, then avg):
 /// mpv_reconstruct_mb_internal's motion handling.
 pub(crate) fn motion(pic: &Pic, cur: &mut FrameBuffer, mb_x: usize, mb_y: usize, p: &MbPrediction) {
+    motion_view(pic, &mut FrameView::new(cur), mb_x, mb_y, p);
+}
+
+fn motion_view(pic: &Pic, cur: &mut FrameView, mb_x: usize, mb_y: usize, p: &MbPrediction) {
     let mut avg = false;
     if p.mv_dir & MV_DIR_FORWARD != 0 {
         if let Some(last) = pic.last {
@@ -1211,7 +1320,7 @@ pub(crate) fn motion(pic: &Pic, cur: &mut FrameBuffer, mb_x: usize, mb_y: usize,
 
 /// mpv_motion_internal for a frame picture.
 #[allow(clippy::too_many_arguments)]
-fn motion_dir(pic: &Pic, cur: &mut FrameBuffer, refp: &FrameBuffer, mb_x: usize, mb_y: usize, p: &MbPrediction, dir: usize, avg: bool) {
+fn motion_dir(pic: &Pic, cur: &mut FrameView, refp: &FrameBuffer, mb_x: usize, mb_y: usize, p: &MbPrediction, dir: usize, avg: bool) {
     match p.mv_type {
         MvType::M16x16 => mpeg_motion(pic, cur, refp, mb_x, mb_y, false, false, false, p.mv[dir][0], 16, avg),
         MvType::Field => {
@@ -1237,7 +1346,7 @@ fn motion_dir(pic: &Pic, cur: &mut FrameBuffer, refp: &FrameBuffer, mb_x: usize,
 #[allow(clippy::too_many_arguments)]
 fn mpeg_motion(
     pic: &Pic,
-    cur: &mut FrameBuffer,
+    cur: &mut FrameView,
     refp: &FrameBuffer,
     mb_x: usize,
     mb_y: usize,
@@ -1250,8 +1359,8 @@ fn mpeg_motion(
 ) {
     let fb = usize::from(field_based);
     let (motion_x, motion_y) = (mv[0], mv[1]);
-    let linesize = cur.y.width();
-    let uvlinesize = cur.cb.width();
+    let linesize = cur.linesize;
+    let uvlinesize = cur.uvlinesize;
     let h_edge_pos = (16 * pic.mb_width) as i32;
     let v_edge_pos = ((16 * pic.mb_height) >> fb) as i32;
     let ls = linesize << fb;
@@ -1269,8 +1378,8 @@ fn mpeg_motion(
     {
         return;
     }
-    let mut dy = mb_y * 16 * linesize + mb_x * 16;
-    let mut dc = mb_y * 8 * uvlinesize + mb_x * 8;
+    let mut dy = (mb_y - cur.row) * 16 * linesize + mb_x * 16;
+    let mut dc = (mb_y - cur.row) * 8 * uvlinesize + mb_x * 8;
     if bottom_field {
         dy += linesize;
         dc += uvlinesize;
@@ -1284,9 +1393,9 @@ fn mpeg_motion(
         sy += linesize;
         sc += uvlinesize;
     }
-    pixels(cur.y.samples_mut(), dy, ls, refp.y.samples(), sy, 16, h as usize, dxy, avg);
-    pixels(cur.cb.samples_mut(), dc, uvls, refp.cb.samples(), sc, 8, (h >> 1) as usize, uvdxy, avg);
-    pixels(cur.cr.samples_mut(), dc, uvls, refp.cr.samples(), sc, 8, (h >> 1) as usize, uvdxy, avg);
+    pixels(cur.y, dy, ls, refp.y.samples(), sy, 16, h as usize, dxy, avg);
+    pixels(cur.cb, dc, uvls, refp.cb.samples(), sc, 8, (h >> 1) as usize, uvdxy, avg);
+    pixels(cur.cr, dc, uvls, refp.cr.samples(), sc, 8, (h >> 1) as usize, uvdxy, avg);
 }
 
 /// hpeldsp put/avg_pixels{16,8}{,_x2,_y2,_xy2}: rounded half-sample
@@ -1296,6 +1405,11 @@ fn mpeg_motion(
 fn pixels(dst: &mut [u8], d: usize, stride: usize, src: &[u8], s: usize, w: usize, h: usize, dxy: i32, avg: bool) {
     let (dx, dy) = (usize::from(dxy & 1 != 0), usize::from(dxy & 2 != 0));
     if h == 0 || s + (h - 1 + dy) * stride + w + dx > src.len() || d + (h - 1) * stride + w > dst.len() {
+        return;
+    }
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+    if w == 8 || w == 16 {
+        crate::simd::pixels(&mut dst[d..], stride, &src[s..], stride, w, h, dxy as u8, 1, avg);
         return;
     }
     for y in 0..h {

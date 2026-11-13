@@ -108,6 +108,7 @@ impl Mpeg2SequenceExtension {
     /// the four start-code bytes `00 00 01 B5`. The trailing
     /// `next_start_code()` byte-align + zero stuffing (§5.2.3) is
     /// not consumed.
+    #[cold]
     pub fn parse(buf: &[u8]) -> Result<Self> {
         let mut br = BitReader::new(buf);
         Self::parse_with_reader(&mut br)
@@ -115,6 +116,7 @@ impl Mpeg2SequenceExtension {
 
     /// Parse from an existing [`BitReader`] positioned at the start
     /// of `sequence_extension()` (i.e. its 32-bit `extension_start_code`).
+    #[cold]
     fn parse_with_reader(br: &mut BitReader<'_>) -> Result<Self> {
         // §6.2.2.3: extension_start_code, value 0x000001B5.
         let code = br.read_u32(32).map_err(|_| Error::ShortHeader)?;

@@ -12,10 +12,10 @@ use oxideav_mpeg12video::quant_matrix_extension::QuantMatrixExtension;
 use oxideav_mpeg12video::sequence_extension::ChromaFormat;
 use oxideav_mpeg12video::sequence_scalable_extension::{ScalableMode, SequenceScalableExtension};
 use oxideav_mpeg12video::{
+    DecodedFrame, FrameBuffer, FrameEncodeOptions, IntraPictureParams,
     decode_snr_scalable_sequence, decode_video_sequence, encode_display_order_gop_sequence,
     encode_display_order_gop_sequence_with_options, encode_ff_display_order_gop_sequence,
-    encode_snr_enhancement_layer, DecodedFrame, FrameBuffer, FrameEncodeOptions,
-    IntraPictureParams,
+    encode_snr_enhancement_layer,
 };
 
 fn params(
@@ -24,17 +24,17 @@ fn params(
     chroma: ChromaFormat,
     progressive: bool,
 ) -> IntraPictureParams {
-    IntraPictureParams {
+    IntraPictureParams::new(
         width,
         height,
-        chroma_format: chroma,
-        frame_pred_frame_dct: progressive,
-        intra_dc_precision: 0,
-        intra_vlc_format: false,
-        alternate_scan: false,
-        q_scale_type: false,
-        progressive_sequence: progressive,
-    }
+        chroma,
+        progressive,
+        0,
+        false,
+        false,
+        false,
+        progressive,
+    )
 }
 
 /// Busy, translating content with a fixed high-contrast stamp.
@@ -44,7 +44,11 @@ fn frame_at(width: usize, height: usize, chroma: ChromaFormat, t: usize) -> Fram
         for x in 0..width {
             let sx = x + 2 * t;
             let g = 24 + ((sx * 3 + y * 5) % 192);
-            let c = if (sx / 4 + y / 4) % 2 == 0 { 16 } else { 0 };
+            let c = if (sx / 4 + y / 4).is_multiple_of(2) {
+                16
+            } else {
+                0
+            };
             let n = (sx * 7 + y * 13) % 9; // fine texture the coarse layer drops
             f.y.put_sample(x, y, (g + c + n).min(235) as u8);
         }
@@ -249,11 +253,9 @@ fn skipped_lower_macroblocks_take_zero_lower_coefficients() {
             f
         })
         .collect();
-    let options = FrameEncodeOptions {
-        skipped_macroblocks: true,
-        concealment_motion_vectors: true,
-        ..Default::default()
-    };
+    let options = FrameEncodeOptions::default()
+        .with_skipped_macroblocks(true)
+        .with_concealment_motion_vectors(true);
     let (base, stats) = encode_display_order_gop_sequence_with_options(
         &sources,
         1,
@@ -285,12 +287,10 @@ fn chroma_422_lower_layer_with_downloaded_matrices_roundtrips_exactly() {
         chroma_intra: None,
         chroma_non_intra: None,
     };
-    let p = IntraPictureParams {
-        intra_vlc_format: true,
-        alternate_scan: true,
-        q_scale_type: true,
-        ..params(64, 48, ChromaFormat::Yuv422, true)
-    };
+    let p = params(64, 48, ChromaFormat::Yuv422, true)
+        .with_intra_vlc_format(true)
+        .with_alternate_scan(true)
+        .with_q_scale_type(true);
     let (base, _) = encode_display_order_gop_sequence_with_options(
         &sources,
         1,
@@ -376,11 +376,9 @@ fn mismatched_pairs_and_garbage_are_rejected_not_panicked() {
         &sources,
         1,
         2,
-        &oxideav_mpeg12video::Mpeg1SequenceParams {
-            horizontal_size: 48,
-            vertical_size: 32,
-            ..Default::default()
-        },
+        &oxideav_mpeg12video::Mpeg1SequenceParams::default()
+            .with_horizontal_size(48)
+            .with_vertical_size(32),
         6,
         3,
         3,

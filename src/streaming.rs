@@ -174,7 +174,8 @@ impl StreamDecoder {
             let stamp = self.take_stamp();
             // Include the boundary prefix: slice walkers use its 23 zero bits
             // as their terminator. At EOF their checked short-tail path applies.
-            let result = self.pictures.picture(&self.buffer[self.cursor..end], stamp);
+            let offset = self.base + self.cursor as u64;
+            let result = self.pictures.picture(&self.buffer[self.cursor..end], stamp, offset);
             self.cursor = next;
             self.scan = next;
             if let Some(frame) = result? { return Ok(Some(frame)); }

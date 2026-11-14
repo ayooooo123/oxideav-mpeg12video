@@ -27,17 +27,17 @@ use std::{path::PathBuf, process::Command};
 
 /// One 16×16 field of a 16×32 interlaced frame.
 fn field_params() -> IntraPictureParams {
-    IntraPictureParams {
-        width: 16,
-        height: 16,
-        chroma_format: ChromaFormat::Yuv420,
-        frame_pred_frame_dct: false,
-        intra_dc_precision: 0,
-        intra_vlc_format: false,
-        alternate_scan: false,
-        q_scale_type: false,
-        progressive_sequence: true,
-    }
+    IntraPictureParams::new(
+        16,
+        16,
+        ChromaFormat::Yuv420,
+        false,
+        0,
+        false,
+        false,
+        false,
+        true,
+    )
 }
 
 /// Textured content, so a prediction from the wrong field is visible.

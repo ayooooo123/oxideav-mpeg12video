@@ -20,23 +20,23 @@
 
 use oxideav_mpeg12video::sequence_extension::ChromaFormat;
 use oxideav_mpeg12video::{
-    decode_video_sequence, encode_intra_picture, mpeg2_inverse_scan_table, DecodedFrame,
-    FrameBuffer, IntraPictureParams, DEFAULT_INTRA_QUANT,
+    DEFAULT_INTRA_QUANT, DecodedFrame, FrameBuffer, IntraPictureParams, decode_video_sequence,
+    encode_intra_picture, mpeg2_inverse_scan_table,
 };
 
 fn params(width: usize, height: usize) -> IntraPictureParams {
-    IntraPictureParams {
-        // progressive sequence: Ceil(h/16) macroblock grid (§6.3.3)
-        progressive_sequence: true,
+    IntraPictureParams::new(
         width,
         height,
-        chroma_format: ChromaFormat::Yuv420,
-        frame_pred_frame_dct: true,
-        intra_dc_precision: 0,
-        intra_vlc_format: false,
-        alternate_scan: false,
-        q_scale_type: false,
-    }
+        ChromaFormat::Yuv420,
+        true,
+        0,
+        false,
+        false,
+        false,
+        // progressive sequence: Ceil(h/16) macroblock grid (§6.3.3)
+        true,
+    )
 }
 
 /// A busy frame (diagonal gradient + checker) so intra AC

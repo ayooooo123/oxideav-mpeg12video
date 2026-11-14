@@ -17,24 +17,24 @@ use oxideav_core::bits::BitWriter;
 use oxideav_mpeg12video::frame_assembly::{FrameBuffer, IntraPictureParams};
 use oxideav_mpeg12video::inter_reconstruction::ReferenceFrames;
 use oxideav_mpeg12video::{
-    decode_inter_picture, ChromaFormat, PictureCodingType, PicturePredictionParams,
+    ChromaFormat, PictureCodingType, PicturePredictionParams, decode_inter_picture,
 };
 
 /// Build a single-macroblock-wide (`mb_width = 1`) P/B picture geometry
 /// for a 16×16 4:2:0 frame.
 fn geometry_16x16() -> IntraPictureParams {
-    IntraPictureParams {
+    IntraPictureParams::new(
+        16,
+        16,
+        ChromaFormat::Yuv420,
+        true,
+        0,
+        false,
+        false,
+        false,
         // hand-built stream: progressive grid (Ceil(h/16) macroblock rows)
-        progressive_sequence: true,
-        width: 16,
-        height: 16,
-        chroma_format: ChromaFormat::Yuv420,
-        frame_pred_frame_dct: true,
-        intra_dc_precision: 0,
-        intra_vlc_format: false,
-        alternate_scan: false,
-        q_scale_type: false,
-    }
+        true,
+    )
 }
 
 /// Write the §6.3.16 slice header for `mb_row = 0`, `quantiser_scale_code`.
@@ -93,8 +93,8 @@ fn p_picture_zero_mv_no_residual_copies_reference() {
     write_slice_header(&mut bw, 8);
     bw.write_u32(0b1, 1); // macroblock_address_increment = 1
     bw.write_u32(0b001, 3); // macroblock_type "MC, Not Coded"
-                            // frame_pred_frame_dct == true → no motion-type tail.
-                            // motion_vectors(0): Frame-based default (1 MV, f_code 1).
+    // frame_pred_frame_dct == true → no motion-type tail.
+    // motion_vectors(0): Frame-based default (1 MV, f_code 1).
     bw.write_u32(0b1, 1); // motion_code horiz = 0 (Table B-10 `1`)
     bw.write_u32(0b1, 1); // motion_code vert = 0
     let picture = append_stop(bw);
@@ -176,10 +176,10 @@ fn b_picture_bidirectional_averages_two_references() {
     write_slice_header(&mut bw, 8);
     bw.write_u32(0b1, 1); // increment = 1
     bw.write_u32(0b10, 2); // macroblock_type "Interp, Not Coded"
-                           // motion_vectors(0) forward: zero MV.
+    // motion_vectors(0) forward: zero MV.
     bw.write_u32(0b1, 1); // fwd motion_code horiz = 0
     bw.write_u32(0b1, 1); // fwd motion_code vert = 0
-                          // motion_vectors(1) backward: zero MV.
+    // motion_vectors(1) backward: zero MV.
     bw.write_u32(0b1, 1); // bwd motion_code horiz = 0
     bw.write_u32(0b1, 1); // bwd motion_code vert = 0
     let picture = append_stop(bw);
@@ -218,12 +218,10 @@ fn p_picture_field_based_zero_mv_copies_reference() {
     // a verbatim copy of the reference frame (each parity copies its own
     // lines), exercising the field-based per-field reference assembly
     // end-to-end.
-    let geom = IntraPictureParams {
+    let geom = (geometry_16x16())
         // hand-built stream: progressive grid (Ceil(h/16) macroblock rows)
-        progressive_sequence: true,
-        frame_pred_frame_dct: false,
-        ..geometry_16x16()
-    };
+        .with_progressive_sequence(true)
+        .with_frame_pred_frame_dct(false);
     let params = PicturePredictionParams {
         geometry: geom,
         ..p_params()
@@ -234,11 +232,11 @@ fn p_picture_field_based_zero_mv_copies_reference() {
     bw.write_u32(0b1, 1); // macroblock_address_increment = 1
     bw.write_u32(0b001, 3); // "MC, Not Coded"
     bw.write_u32(0b01, 2); // frame_motion_type = Field-based (2 vectors)
-                           // Vector 0 (top field): vfs=0 + horiz=0 (`1`) + vert=0 (`1`).
+    // Vector 0 (top field): vfs=0 + horiz=0 (`1`) + vert=0 (`1`).
     bw.write_u32(0b0, 1); // motion_vertical_field_select[0] = 0 (top)
     bw.write_u32(0b1, 1); // motion_code horiz = 0
     bw.write_u32(0b1, 1); // motion_code vert = 0
-                          // Vector 1 (bottom field): vfs=1 + horiz=0 + vert=0.
+    // Vector 1 (bottom field): vfs=1 + horiz=0 + vert=0.
     bw.write_u32(0b1, 1); // motion_vertical_field_select[1] = 1 (bottom)
     bw.write_u32(0b1, 1); // motion_code horiz = 0
     bw.write_u32(0b1, 1); // motion_code vert = 0
@@ -283,12 +281,10 @@ fn p_picture_field_based_top_field_vector_shifts_only_even_lines() {
     // lines (frame rows two apart) — proving the field grid, not the
     // frame grid, is sampled; the odd lines copy verbatim. The two field
     // vectors address their own parity independently.
-    let geom = IntraPictureParams {
+    let geom = (geometry_16x16())
         // hand-built stream: progressive grid (Ceil(h/16) macroblock rows)
-        progressive_sequence: true,
-        frame_pred_frame_dct: false,
-        ..geometry_16x16()
-    };
+        .with_progressive_sequence(true)
+        .with_frame_pred_frame_dct(false);
     let params = PicturePredictionParams {
         geometry: geom,
         ..p_params()
@@ -299,11 +295,11 @@ fn p_picture_field_based_top_field_vector_shifts_only_even_lines() {
     bw.write_u32(0b1, 1); // increment = 1
     bw.write_u32(0b001, 3); // "MC, Not Coded"
     bw.write_u32(0b01, 2); // frame_motion_type = Field-based
-                           // Vector 0 (top field): vfs=0, horiz=0 (`1`), vert=+1 (`010`).
+    // Vector 0 (top field): vfs=0, horiz=0 (`1`), vert=+1 (`010`).
     bw.write_u32(0b0, 1); // vfs[0] = top
     bw.write_u32(0b1, 1); // horiz motion_code = 0
     bw.write_u32(0b010, 3); // vert motion_code = +1
-                            // Vector 1 (bottom field): vfs=1, horiz=0, vert=0.
+    // Vector 1 (bottom field): vfs=1, horiz=0, vert=0.
     bw.write_u32(0b1, 1); // vfs[1] = bottom
     bw.write_u32(0b1, 1); // horiz = 0
     bw.write_u32(0b1, 1); // vert = 0
@@ -362,13 +358,11 @@ fn p_picture_skipped_macroblock_copies_reference() {
     // so use mb_width = 3. MB0 coded at addr 0, increment 2 → MB at
     // addr 2, skipping addr 1. The skipped MB (P-picture) is a (0,0)
     // forward copy of the reference.
-    let geom = IntraPictureParams {
+    let geom = (geometry_16x16())
         // hand-built stream: progressive grid (Ceil(h/16) macroblock rows)
-        progressive_sequence: true,
-        width: 48,
-        height: 16,
-        ..geometry_16x16()
-    };
+        .with_progressive_sequence(true)
+        .with_width(48)
+        .with_height(16);
     let params = PicturePredictionParams {
         geometry: geom,
         ..p_params()
@@ -381,7 +375,7 @@ fn p_picture_skipped_macroblock_copies_reference() {
     bw.write_u32(0b001, 3); // "MC, Not Coded"
     bw.write_u32(0b1, 1); // motion_code horiz = 0
     bw.write_u32(0b1, 1); // motion_code vert = 0
-                          // Next coded MB: increment = 2 (Table B-1 `011`) → skip address 1.
+    // Next coded MB: increment = 2 (Table B-1 `011`) → skip address 1.
     bw.write_u32(0b011, 3); // increment = 2
     bw.write_u32(0b001, 3); // "MC, Not Coded"
     bw.write_u32(0b1, 1); // motion_code horiz = 0
@@ -430,12 +424,10 @@ fn p_picture_frame_dual_prime_averages_four_field_predictions() {
     // bottom field = 180) the top predicted field = avg(60, 180) = 120 and
     // the bottom predicted field = avg(180, 60) = 120 — the whole 16×16
     // frame is 120, formed through the four-field interleave path.
-    let geom = IntraPictureParams {
+    let geom = (geometry_16x16())
         // hand-built stream: progressive grid (Ceil(h/16) macroblock rows)
-        progressive_sequence: true,
-        frame_pred_frame_dct: false,
-        ..geometry_16x16()
-    };
+        .with_progressive_sequence(true)
+        .with_frame_pred_frame_dct(false);
     let params = PicturePredictionParams {
         geometry: geom,
         ..p_params()

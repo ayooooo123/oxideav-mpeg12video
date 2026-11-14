@@ -135,7 +135,7 @@ fn is_intra_more_likely(er: &Er, pic: &Pic, cur: &Cur) -> bool {
                 continue;
             }
             j += 1;
-            if j % skip_amount != 0 {
+            if !j.is_multiple_of(skip_amount) {
                 continue;
             }
             if pic.pict_type == PICT_I {

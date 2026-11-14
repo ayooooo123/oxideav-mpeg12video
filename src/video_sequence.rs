@@ -80,29 +80,42 @@
 //! and picture state. MPEG-1 and MPEG-2, downloaded quantizer matrices,
 //! field pairs and display reordering use the same reconstruction paths.
 
+use std::collections::VecDeque;
+
 use crate::frame_assembly::{
-    assemble_frame_from_fields, decode_intra_picture_with_context, FrameBuffer, IntraDecodeContext,
-    IntraPictureParams,
+    FrameBuffer, IntraDecodeContext, IntraPictureParams, assemble_frame_from_fields,
+    decode_intra_picture_with_context,
 };
 use crate::inter_reconstruction::ReferenceFrames;
-use crate::mpeg1_picture::{decode_mpeg1_d_picture, Mpeg1PictureParams};
+use crate::mpeg1_picture::{
+    Mpeg1InterParams, Mpeg1PictureParams, decode_mpeg1_d_picture, decode_mpeg1_inter_picture,
+    decode_mpeg1_intra_picture,
+};
 use crate::picture_header::{
-    Mpeg2PictureHeader, PictureCodingExtension, PictureCodingType, PictureStructure,
+    Mpeg2PictureHeader, PICTURE_START_CODE, PictureCodingExtension, PictureCodingType,
+    PictureStructure,
 };
 use crate::dual_prime::FieldParity;
 use crate::picture_reconstruction::{
-    decode_field_picture_from, decode_field_picture_with_matrices, decode_inter_picture_with_matrices,
-    PicturePredictionParams,
+    PicturePredictionParams, decode_field_picture_from, decode_field_picture_with_matrices,
+    decode_inter_picture_with_matrices,
 };
 use crate::quant_matrix_extension::{QuantMatrixExtension, QuantiserMatrixState};
 use crate::sequence_extension::{ChromaFormat, Mpeg2Sequence};
+use crate::sequence_header::SEQUENCE_HEADER_CODE;
 use crate::ff_decode;
 use crate::{Error, Result};
 
 /// A reconstructed frame paired with its §6.3.10 `temporal_reference` —
 /// the display index (modulo 1024) the §6.1.1.11 reorder is defined
 /// against.
+///
+/// `#[non_exhaustive]`: the record grows as the decoder surfaces more
+/// per-picture state (as [`stream_offset`](Self::stream_offset) did);
+/// build one outside the crate with [`new`](Self::new) and the
+/// `with_*` setters.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DecodedFrame {
     /// The reconstructed picture in display form.
     pub frame: FrameBuffer,
@@ -127,18 +140,57 @@ pub struct DecodedFrame {
     /// instant. `false` for field-picture pairs; `true` for MPEG-1
     /// frames (11172-2 has no interlace).
     pub progressive_frame: bool,
+    /// Byte offset, from the start of the stream, of the picture start code that
+    /// began this frame (the first field's, for a field pair), so a caller can attach
+    /// the presentation time of the packet that carried it (ISO/IEC 13818-1 2.4.3.7).
+    /// Set by [`SequenceDecoder`]; `None` from the scalable-layer decoders.
+    pub stream_offset: Option<u64>,
 }
 
 impl DecodedFrame {
+    /// A progressive frame (`progressive_frame = true`, no field flags,
+    /// no stream offset): the shape an MPEG-1 frame decodes to.
+    pub fn new(
+        frame: FrameBuffer,
+        temporal_reference: u16,
+        picture_coding_type: PictureCodingType,
+    ) -> Self {
+        Self {
+            frame,
+            temporal_reference,
+            picture_coding_type,
+            top_field_first: false,
+            repeat_first_field: false,
+            progressive_frame: true,
+            stream_offset: None,
+        }
+    }
+
+    /// Sets the §6.3.10 display flags `top_field_first`,
+    /// `repeat_first_field` and `progressive_frame`.
+    pub fn with_display_flags(
+        mut self,
+        top_field_first: bool,
+        repeat_first_field: bool,
+        progressive_frame: bool,
+    ) -> Self {
+        self.top_field_first = top_field_first;
+        self.repeat_first_field = repeat_first_field;
+        self.progressive_frame = progressive_frame;
+        self
+    }
+
+    /// Sets [`stream_offset`](Self::stream_offset).
+    pub fn with_stream_offset(mut self, stream_offset: Option<u64>) -> Self {
+        self.stream_offset = stream_offset;
+        self
+    }
+
     /// The number of **fields** the display process outputs for this
     /// frame in an interlaced sequence (§6.3.10): 3 when
     /// `repeat_first_field` is set, else 2.
     pub fn output_field_count(&self) -> u32 {
-        if self.repeat_first_field {
-            3
-        } else {
-            2
-        }
+        if self.repeat_first_field { 3 } else { 2 }
     }
 
     /// The number of **frames** the display process outputs for this
@@ -245,6 +297,8 @@ pub(crate) struct PictureDecoder {
     held: bool,
     pending_field: Option<PendingField>,
     field_stamp: Stamp,
+    /// Stream offset of the held first field's picture start code.
+    field_offset: u64,
     /// §6.3.8 `closed_gop` of the current GOP.
     closed_gop: bool,
     /// Input may begin at any picture rather than at a sequence start.
@@ -291,7 +345,9 @@ impl PictureDecoder {
         self.geometry.map(|g| g.dimensions())
     }
 
-    pub(crate) fn picture(&mut self, region: &[u8], stamp: Stamp) -> Result<Option<Released>> {
+    /// `offset` is the stream offset of the picture start code opening
+    /// `region`; a field pair reports its first field's.
+    pub(crate) fn picture(&mut self, region: &[u8], stamp: Stamp, offset: u64) -> Result<Option<Released>> {
         let geometry = self.geometry.ok_or(Error::InvalidBitstream("picture before sequence header"))?;
         let coding_type = Mpeg2PictureHeader::parse(region)?.picture_coding_type;
         // §6.3.11: a quant_matrix_extension download persists until the next
@@ -323,13 +379,14 @@ impl PictureDecoder {
         let forward = self.forward.as_ref().map(|f| &f.decoded.frame)
             .or(if closed_leading_b { backward } else { None });
         let mut frame_stamp = stamp;
+        let mut frame_offset = offset;
         // A B-picture is never a reference: when its reconstruction fails
         // on the path without concealment, it is dropped and the anchors
         // stay for the pictures after it, the held one included.
         let b_picture = matches!(coding_type, PictureCodingType::Bidirectional);
         // decode_chunks failed after the picture started (ff_decode).
         let mut abandoned = false;
-        let (decoded, progressive_sequence) = match geometry {
+        let (mut decoded, progressive_sequence) = match geometry {
             SequenceGeometry::Mpeg1(params) => {
                 let header = Mpeg2PictureHeader::parse(region)?;
                 if matches!(coding_type, PictureCodingType::DcIntra) {
@@ -351,6 +408,7 @@ impl PictureDecoder {
                         top_field_first: false,
                         repeat_first_field: false,
                         progressive_frame: true,
+                        stream_offset: None,
                     };
                     (decoded, true)
                 }
@@ -378,6 +436,7 @@ impl PictureDecoder {
                             top_field_first: ext.top_field_first,
                             repeat_first_field: ext.repeat_first_field,
                             progressive_frame: ext.progressive_frame,
+                            stream_offset: None,
                         }
                     } else {
                         match reconstruct_picture(region, &header, &ext, params, forward, backward, &self.matrices) {
@@ -388,16 +447,21 @@ impl PictureDecoder {
                     }
                 } else {
                     // A field pair displays as one frame at its first field's time.
-                    if self.pending_field.is_none() { self.field_stamp = stamp; }
+                    if self.pending_field.is_none() {
+                        self.field_stamp = stamp;
+                        self.field_offset = offset;
+                    }
                     let frame = reconstruct_field_pair(region, &header, &ext, params, forward, backward,
                         &mut self.pending_field, &self.matrices)?;
                     let Some(frame) = frame else { return Ok(None); };
                     frame_stamp = std::mem::take(&mut self.field_stamp);
+                    frame_offset = self.field_offset;
                     frame
                 };
                 (decoded, params.progressive_sequence)
             }
         };
+        decoded.stream_offset = Some(frame_offset);
         // §6.3.10: progressive sequences repeat whole frames; interlaced
         // ones repeat the first field.
         let fields = if progressive_sequence { 2 * decoded.output_frame_count() } else { decoded.output_field_count() };
@@ -488,6 +552,596 @@ impl PictureDecoder {
         };
         let pic = ff_decode::Pic { last, next, ..pic };
         ff_decode::decode_picture(&pic, &region[..ff_decode::parsed_frame_end(region)], fresh, &self.exec_ctx)
+    }
+}
+
+/// Incremental (streaming) form of [`decode_video_sequence`]: elementary
+/// stream bytes go in through [`push`](Self::push) in pieces of any size,
+/// and reconstructed frames come out of [`next_frame`](Self::next_frame)
+/// in §6.1.1.11 display order as soon as the reorder can commit them.
+///
+/// A picture is reconstructed once the start code that ends it has
+/// arrived, so memory stays bounded by one coded picture plus the two
+/// §7.6 reference anchors and the held-back display frame, however long
+/// the sequence. [`finish`](Self::finish) marks the end of the stream,
+/// releasing the last picture and the held anchor. Pushing a whole stream
+/// and finishing yields exactly what [`decode_video_sequence`] returns.
+///
+/// A container that delimits access units can call
+/// [`end_access_unit`](Self::end_access_unit) after pushing each one, so
+/// its picture is decoded at once rather than when the next start code
+/// arrives; with [`coded_order`](Self::coded_order) each picture is then
+/// returned as soon as it is decoded, for consumers (a VideoToolbox-style
+/// decompression session, a demuxer carrying presentation times) that
+/// apply the §6.1.1.11 reorder themselves.
+///
+/// After an error the decoder skips the failed picture; continuing is the
+/// caller's choice (a later picture may then lack a valid reference).
+#[derive(Debug, Default)]
+pub struct SequenceDecoder {
+    /// Unconsumed elementary-stream bytes; `buf[offset..]` is still to
+    /// be walked.
+    buf: Vec<u8>,
+    offset: usize,
+    /// The search start and the end of the bytes already searched
+    /// without a match, so waiting for the end of a long picture rescans
+    /// only newly pushed bytes.
+    searched: Option<(usize, usize)>,
+    finished: bool,
+    /// `None` until the first sequence header has been parsed.
+    state: Option<SequenceState>,
+    ready: VecDeque<DecodedFrame>,
+    /// Set once the final held anchor has been released.
+    drained: bool,
+    /// Replace damaged pictures instead of failing (see
+    /// [`with_concealment`](Self::with_concealment)).
+    conceal: bool,
+    /// The second field of a pair whose first field was concealed or
+    /// skipped is consumed without decoding, keeping pairs aligned.
+    skip_next_field: bool,
+    /// Bytes dropped from the front of `buf`, so `consumed + index` is a
+    /// stream offset.
+    consumed: u64,
+    concealed: usize,
+    skipped: usize,
+    /// Return frames in coded order, skipping the §6.1.1.11 reorder (see
+    /// [`coded_order`](Self::coded_order)).
+    coded_order: bool,
+    /// Stream offset at which the caller declared an access unit to end
+    /// (see [`end_access_unit`](Self::end_access_unit)).
+    unit_end: Option<u64>,
+}
+
+/// The running decode state of the §6.2.2 `video_sequence()` walk.
+#[derive(Debug)]
+struct SequenceState {
+    geometry: SequenceGeometry,
+    /// §6.3.11 weighting matrices: reset to the §6.3.7 defaults at
+    /// every sequence_header_code, then overwritten by the header's
+    /// own load flags and by any `quant_matrix_extension()` between
+    /// pictures. MPEG-1 carries its matrices inside
+    /// `Mpeg1PictureParams` instead (§2.4.2.3, no extension exists).
+    matrices: QuantiserMatrixState,
+    reorder: ReorderBuffer,
+    /// The two running I/P anchors. `forward_anchor` is the older of the
+    /// pair (the past reference); `backward_anchor` is the newer (the
+    /// future reference for B-frames, and the forward reference for the
+    /// next P-frame).
+    forward_anchor: Option<FrameBuffer>,
+    backward_anchor: Option<FrameBuffer>,
+    /// §6.1.1.4.1: field pictures occur in pairs (one top + one bottom)
+    /// that together constitute a coded frame, encoded in output order.
+    /// The first field of a pair is held here until its partner arrives,
+    /// when the two are interleaved into one reconstructed frame
+    /// ([`assemble_frame_from_fields`]).
+    pending_field: Option<PendingField>,
+    /// Stream offset of the held first field's picture start code.
+    first_field_offset: Option<u64>,
+}
+
+impl SequenceDecoder {
+    /// An empty decoder waiting for the stream's first bytes.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A decoder that conceals damage the way a player must: a picture
+    /// that fails to decode is replaced by a copy of its nearest
+    /// reference (the latest anchor for an I/P picture, the forward
+    /// anchor for a B-picture), so its frame slot and the §7.6
+    /// reference rotation survive and the chain recovers at the next
+    /// intra picture. A B-picture without a forward reference (the
+    /// leading pictures of an open GOP when decoding starts mid-stream)
+    /// is dropped, as are pictures whose header cannot be read.
+    /// [`concealed`](Self::concealed) and [`skipped`](Self::skipped)
+    /// count both.
+    pub fn with_concealment() -> Self {
+        Self {
+            conceal: true,
+            ..Self::default()
+        }
+    }
+
+    /// Return frames in **coded** order, as each picture (or field pair)
+    /// is reconstructed, instead of the §6.1.1.11 display order: no
+    /// anchor is held back, so the caller (or the container's
+    /// presentation times) applies the reorder. The §7.6 reference
+    /// rotation is unchanged. Chains after [`new`](Self::new) or
+    /// [`with_concealment`](Self::with_concealment).
+    pub fn coded_order(mut self) -> Self {
+        self.coded_order = true;
+        self
+    }
+
+    /// Pictures replaced by a concealment copy so far.
+    pub fn concealed(&self) -> usize {
+        self.concealed
+    }
+
+    /// Pictures dropped under concealment so far.
+    pub fn skipped(&self) -> usize {
+        self.skipped
+    }
+
+    /// Whether a `sequence_header()` has established the sequence layer
+    /// (§6.2.2), so pictures can be decoded.
+    pub fn has_sequence(&self) -> bool {
+        self.state.is_some()
+    }
+
+    /// Prepare for a seek: forget the buffered bytes, the §7.6 anchors,
+    /// the §6.1.1.11 held-back anchor, any pending first field and the
+    /// frames not yet returned, and withdraw [`finish`](Self::finish) and
+    /// [`end_access_unit`](Self::end_access_unit). The sequence layer
+    /// (the last `sequence_header()` and the §6.3.11 matrices in force)
+    /// stays, so bytes pushed from the new position decode without
+    /// waiting for a sequence header; the first picture there should be
+    /// an I-picture (or use [`with_concealment`](Self::with_concealment),
+    /// which drops unreferenced B-pictures). Stream offsets keep counting
+    /// the bytes pushed in total.
+    pub fn reset(&mut self) {
+        self.consumed += self.buf.len() as u64;
+        self.buf.clear();
+        self.offset = 0;
+        self.searched = None;
+        self.finished = false;
+        self.ready.clear();
+        self.drained = false;
+        self.skip_next_field = false;
+        self.unit_end = None;
+        if let Some(state) = self.state.as_mut() {
+            state.reorder = ReorderBuffer::new();
+            state.forward_anchor = None;
+            state.backward_anchor = None;
+            state.pending_field = None;
+            state.first_field_offset = None;
+        }
+    }
+
+    /// Append the next piece of the elementary stream.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Declare that the bytes pushed so far end on a picture boundary (the
+    /// container delimited an access unit): the picture at the end of the
+    /// buffer is decoded without waiting for the start code that follows
+    /// it. Pushing more bytes first withdraws the declaration, which only
+    /// ever describes the current end of the buffer.
+    pub fn end_access_unit(&mut self) {
+        self.unit_end = Some(self.consumed + self.buf.len() as u64);
+    }
+
+    /// Whether the unit at the end of the buffer is known to be complete:
+    /// the stream is finished, or the caller ended an access unit there.
+    fn at_unit_end(&self) -> bool {
+        self.finished || self.unit_end == Some(self.consumed + self.buf.len() as u64)
+    }
+
+    /// Mark the end of the stream: the last picture runs to the end of
+    /// the pushed bytes, and the held-back anchor is released.
+    pub fn finish(&mut self) {
+        self.finished = true;
+    }
+
+    /// The next frame in display order, or `Ok(None)` when more input
+    /// (or [`finish`](Self::finish)) is needed, or once the finished
+    /// stream is exhausted.
+    ///
+    /// # Errors
+    ///
+    /// As [`decode_video_sequence`]: a missing sequence header (reported
+    /// once the stream is finished), or any picture-layer failure.
+    pub fn next_frame(&mut self) -> Result<Option<DecodedFrame>> {
+        loop {
+            if let Some(frame) = self.ready.pop_front() {
+                return Ok(Some(frame));
+            }
+            if self.drained {
+                return Ok(None);
+            }
+            if self.state.is_none() && !self.start_sequence()? {
+                return Ok(None);
+            }
+            if !self.step()? {
+                self.compact();
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Establish the geometry from the first sequence header in the
+    /// stream (§6.2.2), once its extensions are complete: a following
+    /// picture or sequence start code proves they have all arrived.
+    /// Returns whether decoding can begin.
+    fn start_sequence(&mut self) -> Result<bool> {
+        let Some(at) = find_start_code(&self.buf, |code| code == SEQUENCE_HEADER_CODE) else {
+            if self.finished {
+                return Err(Error::InvalidBitstream(
+                    "video_sequence(): missing leading sequence_header_code 0x000001B3 (§6.2.2)",
+                ));
+            }
+            return Ok(false);
+        };
+        if !self.at_unit_end()
+            && self
+                .find_from(at + 4, find_picture_or_sequence_start_code)
+                .is_none()
+        {
+            return Ok(false);
+        }
+        let (geometry, _) = sequence_geometry_at(&self.buf[at..])?;
+        self.state = Some(SequenceState {
+            geometry,
+            matrices: geometry.initial_matrices(),
+            reorder: ReorderBuffer::new(),
+            forward_anchor: None,
+            backward_anchor: None,
+            pending_field: None,
+            first_field_offset: None,
+        });
+        Ok(true)
+    }
+
+    /// Decode the next sequence header or picture. Returns `false` when
+    /// the unit at the front is not complete yet.
+    fn step(&mut self) -> Result<bool> {
+        let Some(rel) = find_picture_or_sequence_start_code(&self.buf[self.offset..]) else {
+            if self.finished {
+                let state = self.state.as_mut().expect("sequence started");
+                let mut output = Vec::new();
+                // §6.1.1.11: flush the final held-back I/P anchor.
+                state.reorder.flush(&mut output);
+                self.ready.extend(output);
+                self.drained = true;
+                return Ok(true);
+            }
+            // No start code yet; only the last three bytes can begin one.
+            self.offset = self.offset.max(self.buf.len().saturating_sub(3));
+            return Ok(false);
+        };
+        let code_start = self.offset + rel;
+
+        // A `sequence_header()` before the next picture re-establishes the
+        // geometry (§6.1.1.6). The reorder buffer and anchors carry across
+        // — §6.1.1.11 reordering is defined over the whole reconstructed
+        // sequence, and a repeat sequence header does not by itself force a
+        // flush (the next coded frame, which §6.1.1.11 requires not to be a
+        // B-frame, is an I/P anchor that flushes the held one in the normal
+        // way).
+        if is_start_code(&self.buf[code_start..], SEQUENCE_HEADER_CODE) {
+            if !self.at_unit_end()
+                && self
+                    .find_from(code_start + 4, find_picture_or_sequence_start_code)
+                    .is_none()
+            {
+                self.offset = code_start;
+                return Ok(false);
+            }
+            let state = self.state.as_mut().expect("sequence started");
+            state.geometry = sequence_geometry_at(&self.buf[code_start..])?.0;
+            // §6.3.11: "When a sequence_header_code is decoded all
+            // matrices shall be reset to their default values" — then
+            // the header's own load flags apply.
+            state.matrices = state.geometry.initial_matrices();
+            // Advance past this sequence header's start code; the next scan
+            // finds the sequence_extension / picture that follows.
+            self.offset = code_start + 4;
+            return Ok(true);
+        }
+
+        let pic_start = code_start;
+
+        // The picture spans from its picture_start_code up to the next
+        // picture / GOP / sequence / sequence-end start code. The
+        // boundary start code's own bytes are **included** in the region:
+        // the per-picture slice walkers peek for the §5.2.3 23-zero
+        // start-code prefix to detect end-of-slice, so the buffer must
+        // carry that prefix or the last slice is truncated one macroblock
+        // early. The next iteration still re-anchors on the boundary
+        // start code (`next_offset`), so including its bytes here only
+        // lends the walker its terminator — the drivers stop their own
+        // slice scan at the first non-slice start code regardless.
+        let boundary = self.find_from(pic_start + 4, find_next_picture_boundary);
+        if boundary.is_none() && !self.at_unit_end() {
+            self.offset = pic_start;
+            return Ok(false);
+        }
+        let (region_end, next_offset) = match boundary {
+            // Include the 4-byte boundary start code in the slice buffer.
+            Some(b) => ((b + 4).min(self.buf.len()), b),
+            None => (self.buf.len(), self.buf.len()),
+        };
+        self.offset = next_offset;
+        let picture_region = &self.buf[pic_start..region_end];
+        let state = self.state.as_mut().expect("sequence started");
+        let kind = picture_kind(picture_region, &state.geometry);
+        let field = kind.is_some_and(|k| k.field);
+        if self.conceal {
+            if self.skip_next_field && field {
+                self.skip_next_field = false;
+                return Ok(true);
+            }
+            self.skip_next_field = false;
+            let unreferenced_b = kind.is_some_and(|k| {
+                k.coding_type == PictureCodingType::Bidirectional && state.forward_anchor.is_none()
+            });
+            if kind.is_none() || unreferenced_b {
+                self.skipped += 1;
+                self.skip_next_field = field && state.pending_field.is_none();
+                state.pending_field = None;
+                return Ok(true);
+            }
+        }
+        let first_field = field && state.pending_field.is_none();
+        let offset = self.consumed + pic_start as u64;
+        // A field pair's frame is located by its first field's picture start code.
+        let frame_offset = if field && !first_field {
+            state.first_field_offset.take().unwrap_or(offset)
+        } else {
+            offset
+        };
+        let mut coded = match decode_picture(state, picture_region) {
+            Ok(Some(coded)) => coded,
+            // First field of a pair: held back, no frame yet.
+            Ok(None) => {
+                state.first_field_offset = Some(offset);
+                return Ok(true);
+            }
+            Err(e) if !self.conceal => return Err(e),
+            Err(_) => {
+                self.skip_next_field = first_field;
+                state.pending_field = None;
+                let kind = kind.expect("checked above");
+                let Some(coded) = concealment_copy(state, kind) else {
+                    self.skipped += 1;
+                    return Ok(true);
+                };
+                self.concealed += 1;
+                coded
+            }
+        };
+        coded.stream_offset = Some(frame_offset);
+        let mut output = Vec::new();
+        route(state, coded, self.coded_order, &mut output);
+        self.ready.extend(output);
+        Ok(true)
+    }
+
+    /// Runs `finder` over `buf[start..]` and returns the absolute offset of
+    /// the match, resuming after the bytes a previous unsuccessful search
+    /// from the same `start` already covered (less three, since a start
+    /// code may straddle the old end).
+    fn find_from(&mut self, start: usize, finder: fn(&[u8]) -> Option<usize>) -> Option<usize> {
+        let resume = match self.searched {
+            Some((from, to)) if from == start => to.saturating_sub(3).max(start),
+            _ => start,
+        };
+        let found = finder(self.buf.get(resume..).unwrap_or(&[])).map(|p| resume + p);
+        self.searched = if found.is_none() {
+            Some((start, self.buf.len()))
+        } else {
+            None
+        };
+        found
+    }
+
+    /// Drop consumed bytes once they make up half the buffer, so the
+    /// memmove cost stays linear in the stream length overall.
+    fn compact(&mut self) {
+        if self.state.is_none() || self.offset < self.buf.len() / 2 {
+            return;
+        }
+        let gone = self.offset;
+        self.buf.drain(..gone);
+        self.consumed += gone as u64;
+        self.offset = 0;
+        self.searched = self
+            .searched
+            .and_then(|(from, to)| Some((from.checked_sub(gone)?, to - gone)));
+    }
+}
+
+/// What a picture header says about the picture, read before decoding so
+/// a damaged picture can still be concealed in its slot.
+#[derive(Debug, Clone, Copy)]
+struct PictureKind {
+    coding_type: PictureCodingType,
+    temporal_reference: u16,
+    /// A field picture (one half of a §6.1.1.4.1 pair).
+    field: bool,
+    top_field_first: bool,
+    repeat_first_field: bool,
+    progressive_frame: bool,
+}
+
+fn picture_kind(picture_region: &[u8], geometry: &SequenceGeometry) -> Option<PictureKind> {
+    match geometry {
+        SequenceGeometry::Mpeg1(_) => {
+            let header = Mpeg2PictureHeader::parse(picture_region).ok()?;
+            Some(PictureKind {
+                coding_type: header.picture_coding_type,
+                temporal_reference: header.temporal_reference,
+                field: false,
+                top_field_first: false,
+                repeat_first_field: false,
+                progressive_frame: true,
+            })
+        }
+        SequenceGeometry::Mpeg2(..) => {
+            let (header, ext) = Mpeg2PictureHeader::parse_with_extension(picture_region).ok()?;
+            let field = ext.picture_structure != PictureStructure::Frame;
+            Some(PictureKind {
+                coding_type: header.picture_coding_type,
+                temporal_reference: header.temporal_reference,
+                field,
+                top_field_first: ext.top_field_first,
+                repeat_first_field: !field && ext.repeat_first_field,
+                progressive_frame: !field && ext.progressive_frame,
+            })
+        }
+    }
+}
+
+/// The concealment stand-in for a picture that failed to decode: a copy
+/// of the forward anchor for a B-picture, of the latest anchor otherwise.
+/// `None` when no reference exists yet.
+fn concealment_copy(state: &SequenceState, kind: PictureKind) -> Option<DecodedFrame> {
+    let source = match kind.coding_type {
+        PictureCodingType::Bidirectional => state.forward_anchor.as_ref(),
+        _ => state.backward_anchor.as_ref(),
+    }?;
+    Some(DecodedFrame {
+        frame: source.clone(),
+        temporal_reference: kind.temporal_reference,
+        picture_coding_type: kind.coding_type,
+        top_field_first: kind.top_field_first,
+        repeat_first_field: kind.repeat_first_field,
+        progressive_frame: kind.progressive_frame,
+        stream_offset: None,
+    })
+}
+
+/// Reconstructs one coded picture against the running anchors. `None`
+/// for the first field of a pair, which is held until its partner.
+fn decode_picture(
+    state: &mut SequenceState,
+    picture_region: &[u8],
+) -> Result<Option<DecodedFrame>> {
+    let coded = match state.geometry {
+        SequenceGeometry::Mpeg1(mpeg1_params) => {
+            // ISO/IEC 11172-2: frame pictures only, no
+            // picture_coding_extension — the motion-vector context
+            // (f_codes + full_pel flags) lives in the picture
+            // header itself (§2.4.3.4).
+            let header = Mpeg2PictureHeader::parse(picture_region)?;
+            reconstruct_mpeg1_picture(
+                picture_region,
+                &header,
+                &mpeg1_params,
+                state.forward_anchor.as_ref(),
+                state.backward_anchor.as_ref(),
+            )?
+        }
+        SequenceGeometry::Mpeg2(mpeg2_geometry, _) => {
+            let (header, ext) = Mpeg2PictureHeader::parse_with_extension(picture_region)?;
+
+            // §6.2.3.7 extension_and_user_data(2): any
+            // `quant_matrix_extension()` between the
+            // picture_coding_extension and the first slice updates
+            // the running §6.3.11 matrices (which then persist for
+            // the following pictures until the next
+            // sequence_header_code reset).
+            apply_quant_matrix_extensions(
+                picture_region,
+                mpeg2_geometry.chroma_format,
+                &mut state.matrices,
+            )?;
+
+            // §6.1.1.4.1 field-picture pair: decode the field, hold the
+            // first of a pair until its partner arrives, then interleave
+            // the pair into one reconstructed frame and route that frame
+            // exactly as a frame picture would be.
+            if ext.picture_structure != PictureStructure::Frame {
+                match reconstruct_field_pair(
+                    picture_region,
+                    &header,
+                    &ext,
+                    mpeg2_geometry,
+                    state.forward_anchor.as_ref(),
+                    state.backward_anchor.as_ref(),
+                    &mut state.pending_field,
+                    &state.matrices,
+                )? {
+                    // First field of a pair: held back, no frame yet.
+                    None => return Ok(None),
+                    // Second field completed the pair into a frame.
+                    Some(frame) => frame,
+                }
+            } else {
+                // The slice region begins after the picture header +
+                // extensions: the per-picture drivers find the first
+                // slice_start_code themselves, so we hand them the whole
+                // picture region.
+                reconstruct_picture(
+                    picture_region,
+                    &header,
+                    &ext,
+                    mpeg2_geometry,
+                    state.forward_anchor.as_ref(),
+                    state.backward_anchor.as_ref(),
+                    &state.matrices,
+                )?
+            }
+        }
+    };
+    Ok(Some(coded))
+}
+
+/// §6.1.1.11 reorder + §7.6 reference rotation of a reconstructed (or
+/// concealed) picture; frames ready for display go to `output`. In coded
+/// order the picture goes straight to `output` and only the reference
+/// rotation applies.
+fn route(
+    state: &mut SequenceState,
+    coded: DecodedFrame,
+    coded_order: bool,
+    output: &mut Vec<DecodedFrame>,
+) {
+    if coded_order {
+        if matches!(
+            coded.picture_coding_type,
+            PictureCodingType::Intra | PictureCodingType::Predictive
+        ) {
+            state.forward_anchor = state.backward_anchor.take();
+            state.backward_anchor = Some(coded.frame.clone());
+        }
+        output.push(coded);
+        return;
+    }
+    match coded.picture_coding_type {
+        PictureCodingType::Bidirectional => {
+            // B-frames are displayed immediately, in coded order, and
+            // never become a reference. They emit before the held-back
+            // anchor.
+            state.reorder.push_b(coded, output);
+        }
+        PictureCodingType::DcIntra => {
+            // 11172-2 §2.4.1: a D-picture sequence contains no
+            // other picture types, so there is no reorder and no
+            // reference rotation — D-pictures display in coded
+            // order and never serve as a prediction reference.
+            output.push(coded);
+        }
+        PictureCodingType::Intra | PictureCodingType::Predictive => {
+            // An I/P frame displaces the previously held-back anchor
+            // (which now displays) and becomes the new held-back
+            // anchor. Rotate the §7.6 reference pair: the old backward
+            // anchor becomes the new forward anchor.
+            state.reorder.push_anchor(coded.clone(), output);
+            state.forward_anchor = state.backward_anchor.take();
+            state.backward_anchor = Some(coded.frame);
+        }
     }
 }
 
@@ -589,12 +1243,12 @@ pub fn display_indices_from_coded_pictures(pictures: &[(u16, PictureCodingType)]
             PictureCodingType::Intra | PictureCodingType::Predictive
         );
         if is_anchor {
-            if let Some(prev) = prev_anchor_tr {
-                if tr <= prev {
-                    // §6.3.9 GOP reset: advance the base past the
-                    // previous GOP's highest display index.
-                    gop_base = gop_max.map_or(0, |m| m + 1);
-                }
+            if let Some(prev) = prev_anchor_tr
+                && tr <= prev
+            {
+                // §6.3.9 GOP reset: advance the base past the
+                // previous GOP's highest display index.
+                gop_base = gop_max.map_or(0, |m| m + 1);
             }
             prev_anchor_tr = Some(tr);
         }
@@ -700,12 +1354,12 @@ fn verify_display_order_against_indices(
                 "verify_display_order: display frame has no matching coded frame (not a permutation)",
             ));
         };
-        if let Some(p) = prev {
-            if idx <= p {
-                return Err(Error::InvalidBitstream(
-                    "verify_display_order: display order not strictly increasing in display index (§6.1.1.11)",
-                ));
-            }
+        if let Some(p) = prev
+            && idx <= p
+        {
+            return Err(Error::InvalidBitstream(
+                "verify_display_order: display order not strictly increasing in display index (§6.1.1.11)",
+            ));
         }
         prev = Some(idx);
         available.swap_remove(pos);
@@ -714,6 +1368,43 @@ fn verify_display_order_against_indices(
     Ok(())
 }
 
+/// Holds back one I/P anchor by one picture so it displays *after* the
+/// B-frames that follow it in coded order but precede it in display
+/// order (§6.1.1.11).
+#[derive(Debug, Default)]
+struct ReorderBuffer {
+    /// The most recently decoded I/P frame, waiting to be displayed once
+    /// the next anchor arrives (or at end of stream).
+    held_anchor: Option<DecodedFrame>,
+}
+
+impl ReorderBuffer {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// A B-frame: emit it immediately (coded order == display order for a
+    /// B-frame, which is always displayed before the next anchor).
+    fn push_b(&mut self, frame: DecodedFrame, output: &mut Vec<DecodedFrame>) {
+        output.push(frame);
+    }
+
+    /// An I/P frame: the previously held anchor now displays, and this
+    /// frame becomes the new held anchor.
+    fn push_anchor(&mut self, frame: DecodedFrame, output: &mut Vec<DecodedFrame>) {
+        if let Some(prev) = self.held_anchor.take() {
+            output.push(prev);
+        }
+        self.held_anchor = Some(frame);
+    }
+
+    /// End of sequence: flush the final held anchor.
+    fn flush(&mut self, output: &mut Vec<DecodedFrame>) {
+        if let Some(prev) = self.held_anchor.take() {
+            output.push(prev);
+        }
+    }
+}
 
 /// The parsed sequence layer, discriminating the two standards this
 /// crate decodes: an ISO/IEC 13818-2 stream (sequence_header +
@@ -969,7 +1660,7 @@ fn reconstruct_picture(
         PictureCodingType::DcIntra => {
             return Err(Error::InvalidBitstream(
                 "picture_coding_type: 100 (D-picture) shall not be used in MPEG-2 (Table 6-12)",
-            ))
+            ));
         }
         PictureCodingType::Predictive => {
             // §7.6: a P-frame predicts from the latest decoded I/P anchor.
@@ -1014,6 +1705,7 @@ fn reconstruct_picture(
         top_field_first: ext.top_field_first,
         repeat_first_field: ext.repeat_first_field,
         progressive_frame: ext.progressive_frame,
+        stream_offset: None,
     })
 }
 
@@ -1039,6 +1731,7 @@ fn reconstruct_mpeg1_d_picture(
         top_field_first: false,
         repeat_first_field: false,
         progressive_frame: true,
+        stream_offset: None,
     })
 }
 
@@ -1147,7 +1840,7 @@ fn reconstruct_field_pair(
         PictureCodingType::DcIntra => {
             return Err(Error::InvalidBitstream(
                 "picture_coding_type: 100 (D-picture) shall not be used in MPEG-2 (Table 6-12)",
-            ))
+            ));
         }
         PictureCodingType::Intra => {
             // An I **field** picture must be walked with the field
@@ -1260,6 +1953,7 @@ fn reconstruct_field_pair(
                 top_field_first: first.structure == PictureStructure::TopField,
                 repeat_first_field: false,
                 progressive_frame: false,
+                stream_offset: None,
             }))
         }
     }
@@ -1479,6 +2173,156 @@ pub(crate) fn find_next_picture_boundary(buf: &[u8]) -> Option<usize> {
 }
 
 
+/// Reconstruct one ISO/IEC 11172-2 picture, dispatching on
+/// `picture_coding_type`. MPEG-1 pictures are always frame pictures;
+/// the motion-vector context (forward/backward f_code + full_pel
+/// flags) comes straight from the picture header (§2.4.3.4).
+fn reconstruct_mpeg1_picture(
+    picture_region: &[u8],
+    header: &Mpeg2PictureHeader,
+    params: &Mpeg1PictureParams,
+    forward_anchor: Option<&FrameBuffer>,
+    backward_anchor: Option<&FrameBuffer>,
+) -> Result<DecodedFrame> {
+    let frame = match header.picture_coding_type {
+        PictureCodingType::Intra => {
+            let (frame, placed) = decode_mpeg1_intra_picture(picture_region, params)?;
+            require_full_coverage(
+                placed,
+                params.width.div_ceil(16),
+                params.height.div_ceil(16),
+            )?;
+            frame
+        }
+        PictureCodingType::DcIntra => {
+            // §2.4.3.4 dc intra-coded picture: DC-only intra blocks,
+            // Table B.2d macroblock type, end_of_macroblock markers.
+            let (frame, placed) = decode_mpeg1_d_picture(picture_region, params)?;
+            require_full_coverage(
+                placed,
+                params.width.div_ceil(16),
+                params.height.div_ceil(16),
+            )?;
+            frame
+        }
+        PictureCodingType::Predictive => {
+            let forward = backward_anchor.ok_or(Error::InvalidBitstream(
+                "§2.4.1: P-picture before any I/P anchor exists (no forward reference)",
+            ))?;
+            let inter = mpeg1_inter_params(header, params)?;
+            let (frame, placed) = decode_mpeg1_inter_picture(
+                picture_region,
+                &inter,
+                ReferenceFrames::forward_only(forward),
+            )?;
+            require_full_coverage(
+                placed,
+                params.width.div_ceil(16),
+                params.height.div_ceil(16),
+            )?;
+            frame
+        }
+        PictureCodingType::Bidirectional => {
+            let forward = forward_anchor.ok_or(Error::InvalidBitstream(
+                "§2.4.1: B-picture before two I/P anchors exist (no forward reference)",
+            ))?;
+            let backward = backward_anchor.ok_or(Error::InvalidBitstream(
+                "§2.4.1: B-picture before two I/P anchors exist (no backward reference)",
+            ))?;
+            let inter = mpeg1_inter_params(header, params)?;
+            let (frame, placed) = decode_mpeg1_inter_picture(
+                picture_region,
+                &inter,
+                ReferenceFrames::bidirectional(forward, backward),
+            )?;
+            require_full_coverage(
+                placed,
+                params.width.div_ceil(16),
+                params.height.div_ceil(16),
+            )?;
+            frame
+        }
+    };
+
+    Ok(DecodedFrame {
+        frame,
+        temporal_reference: header.temporal_reference,
+        picture_coding_type: header.picture_coding_type,
+        // ISO/IEC 11172-2 codes progressive frames only.
+        top_field_first: false,
+        repeat_first_field: false,
+        progressive_frame: true,
+        stream_offset: None,
+    })
+}
+
+/// Build the §2.4.4.2 / §2.4.4.3 motion context for an MPEG-1 P/B
+/// picture from its picture header.
+fn mpeg1_inter_params(
+    header: &Mpeg2PictureHeader,
+    params: &Mpeg1PictureParams,
+) -> Result<Mpeg1InterParams> {
+    let forward_f_code = header.fwd_f_code.ok_or(Error::InvalidBitstream(
+        "mpeg1 P/B picture header missing forward_f_code (§2.4.3.4)",
+    ))?;
+    let full_pel_forward_vector = header.full_pel_forward_vector.unwrap_or(false);
+    let (backward_f_code, full_pel_backward_vector) =
+        if header.picture_coding_type == PictureCodingType::Bidirectional {
+            (
+                header.bwd_f_code.ok_or(Error::InvalidBitstream(
+                    "mpeg1 B picture header missing backward_f_code (§2.4.3.4)",
+                ))?,
+                header.full_pel_backward_vector.unwrap_or(false),
+            )
+        } else {
+            (1, false)
+        };
+    Ok(Mpeg1InterParams {
+        base: *params,
+        picture_coding_type: header.picture_coding_type,
+        forward_f_code,
+        full_pel_forward_vector,
+        backward_f_code,
+        full_pel_backward_vector,
+    })
+}
+
+/// Find the byte offset of the next `picture_start_code` (`0x00000100`)
+/// or `sequence_header_code` (`0x000001B3`) in `buf`, or `None`. These
+/// are the two start codes the top-level loop dispatches on: a picture to
+/// reconstruct, or a sequence header to re-read the geometry from.
+fn find_picture_or_sequence_start_code(buf: &[u8]) -> Option<usize> {
+    find_start_code(buf, |code| {
+        code == PICTURE_START_CODE || code == SEQUENCE_HEADER_CODE
+    })
+}
+
+/// Whether `buf` begins with the start code `code`.
+fn is_start_code(buf: &[u8], code: u32) -> bool {
+    buf.len() >= 4
+        && (u32::from(buf[0]) << 24
+            | u32::from(buf[1]) << 16
+            | u32::from(buf[2]) << 8
+            | u32::from(buf[3]))
+            == code
+}
+
+/// Find the byte offset of the first start code whose 32-bit value
+/// satisfies `pred`, or `None`.
+fn find_start_code(buf: &[u8], pred: impl Fn(u32) -> bool) -> Option<usize> {
+    buf.windows(4).position(|w| {
+        if w[0] == 0x00 && w[1] == 0x00 && w[2] == 0x01 {
+            let code = (u32::from(w[0]) << 24)
+                | (u32::from(w[1]) << 16)
+                | (u32::from(w[2]) << 8)
+                | u32::from(w[3]);
+            pred(code)
+        } else {
+            false
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1509,6 +2353,21 @@ mod tests {
         assert_eq!(find_next_picture_boundary(&buf3), None);
     }
 
+    fn frame_with(tref: u16, kind: PictureCodingType) -> DecodedFrame {
+        DecodedFrame {
+            top_field_first: false,
+            repeat_first_field: false,
+            progressive_frame: true,
+            stream_offset: None,
+            frame: FrameBuffer::new(16, 16, crate::sequence_extension::ChromaFormat::Yuv420),
+            temporal_reference: tref,
+            picture_coding_type: kind,
+        }
+    }
+
+    fn trefs(output: &[DecodedFrame]) -> Vec<u16> {
+        output.iter().map(|f| f.temporal_reference).collect()
+    }
 
     use crate::sequence_extension::ChromaFormat;
 
@@ -1756,5 +2615,70 @@ mod tests {
             verify_display_order(&[0u16, 1, 2], &[0u16, 1, 9]),
             Err(Error::InvalidBitstream(_))
         ));
+    }
+
+    #[test]
+    fn reorder_buffer_passes_b_frames_through_immediately() {
+        let mut output = Vec::new();
+        let mut buf = ReorderBuffer::new();
+
+        // Coded order I B B P → display I B B P (anchor held one back).
+        buf.push_anchor(frame_with(0, PictureCodingType::Intra), &mut output);
+        // I is held; nothing displayed yet.
+        assert!(output.is_empty());
+
+        buf.push_b(frame_with(1, PictureCodingType::Bidirectional), &mut output);
+        buf.push_b(frame_with(2, PictureCodingType::Bidirectional), &mut output);
+        // The two B-frames display immediately, before the held I.
+        assert_eq!(trefs(&output), vec![1, 2]);
+
+        buf.push_anchor(frame_with(3, PictureCodingType::Predictive), &mut output);
+        // The held I now displays as the new anchor arrives.
+        assert_eq!(trefs(&output), vec![1, 2, 0]);
+
+        buf.flush(&mut output);
+        // The final P flushes.
+        assert_eq!(trefs(&output), vec![1, 2, 0, 3]);
+    }
+
+    #[test]
+    fn reorder_matches_spec_6_1_1_11_example() {
+        // §6.1.1.11 worked example, coded order:
+        //   1I 4P 2B 3B 7P 5B 6B
+        // (temporal_reference shown; display order 1 2 3 4 5 6 7).
+        let mut output = Vec::new();
+        let mut buf = ReorderBuffer::new();
+
+        let coded: &[(u16, PictureCodingType)] = &[
+            (0, PictureCodingType::Intra),         // 1I
+            (3, PictureCodingType::Predictive),    // 4P
+            (1, PictureCodingType::Bidirectional), // 2B
+            (2, PictureCodingType::Bidirectional), // 3B
+            (6, PictureCodingType::Predictive),    // 7P
+            (4, PictureCodingType::Bidirectional), // 5B
+            (5, PictureCodingType::Bidirectional), // 6B
+        ];
+        for &(tref, kind) in coded {
+            match kind {
+                PictureCodingType::Bidirectional => buf.push_b(frame_with(tref, kind), &mut output),
+                _ => buf.push_anchor(frame_with(tref, kind), &mut output),
+            }
+        }
+        buf.flush(&mut output);
+
+        // Display order temporal_references: 0 1 2 3 4 5 6.
+        assert_eq!(trefs(&output), vec![0, 1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn no_b_frames_keeps_coded_order() {
+        // I P P → no reordering (low_delay-style, §6.1.1.11).
+        let mut output = Vec::new();
+        let mut buf = ReorderBuffer::new();
+        buf.push_anchor(frame_with(0, PictureCodingType::Intra), &mut output);
+        buf.push_anchor(frame_with(1, PictureCodingType::Predictive), &mut output);
+        buf.push_anchor(frame_with(2, PictureCodingType::Predictive), &mut output);
+        buf.flush(&mut output);
+        assert_eq!(trefs(&output), vec![0, 1, 2]);
     }
 }

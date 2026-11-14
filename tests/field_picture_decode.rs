@@ -19,25 +19,24 @@ use oxideav_mpeg12video::frame_assembly::{FrameBuffer, IntraPictureParams};
 use oxideav_mpeg12video::inter_reconstruction::ReferenceFrames;
 use oxideav_mpeg12video::picture_header::PictureStructure;
 use oxideav_mpeg12video::{
-    decode_field_picture, ChromaFormat, PictureCodingType, PicturePredictionParams,
+    ChromaFormat, PictureCodingType, PicturePredictionParams, decode_field_picture,
 };
 
 /// Field geometry for a 16×16-luma **field** (the field of a 16×32
 /// reference frame), 4:2:0, single-macroblock-wide.
 fn field_geometry_16x16() -> IntraPictureParams {
-    IntraPictureParams {
+    IntraPictureParams::new(
+        16,
+        16,                   // FIELD height (the frame is 32 rows)
+        ChromaFormat::Yuv420, // A field picture forbids frame_pred_frame_dct.
+        false,
+        0,
+        false,
+        false,
+        false,
         // hand-built stream: progressive grid (Ceil(h/16) macroblock rows)
-        progressive_sequence: true,
-        width: 16,
-        height: 16, // FIELD height (the frame is 32 rows)
-        chroma_format: ChromaFormat::Yuv420,
-        // A field picture forbids frame_pred_frame_dct.
-        frame_pred_frame_dct: false,
-        intra_dc_precision: 0,
-        intra_vlc_format: false,
-        alternate_scan: false,
-        q_scale_type: false,
-    }
+        true,
+    )
 }
 
 fn write_slice_header(bw: &mut BitWriter, q_scale: u8) {
@@ -211,12 +210,10 @@ fn field_picture_two_macroblocks_with_skip() {
     // MV, top-field select), then increment = 2 reaching address 2, which
     // skips address 1. The §7.6.6.2 P-picture skip is a (0,0) forward
     // copy reading the same-parity (top) reference field.
-    let geom = IntraPictureParams {
+    let geom = (field_geometry_16x16())
         // hand-built stream: progressive grid (Ceil(h/16) macroblock rows)
-        progressive_sequence: true,
-        width: 48,
-        ..field_geometry_16x16()
-    };
+        .with_progressive_sequence(true)
+        .with_width(48);
     let params = PicturePredictionParams {
         geometry: geom,
         ..p_params()
@@ -231,7 +228,7 @@ fn field_picture_two_macroblocks_with_skip() {
     bw.write_u32(0b0, 1); // field-select = top
     bw.write_u32(0b1, 1); // horiz = 0
     bw.write_u32(0b1, 1); // vert = 0
-                          // Next coded MB at address 2: increment = 2 (Table B-1 `011`).
+    // Next coded MB at address 2: increment = 2 (Table B-1 `011`).
     bw.write_u32(0b011, 3); // increment = 2 → skip address 1
     bw.write_u32(0b001, 3); // "MC, Not Coded"
     bw.write_u32(0b01, 2); // field_motion_type = Field-based
@@ -283,7 +280,7 @@ fn field_picture_16x8_regions_select_independent_fields_end_to_end() {
     bw.write_u32(0b1, 1); // macroblock_address_increment = 1
     bw.write_u32(0b001, 3); // macroblock_type "MC, Not Coded"
     bw.write_u32(0b10, 2); // field_motion_type = 16x8 MC (2 vectors)
-                           // motion_vectors(0): upper region (vfs, h, v) then lower (vfs, h, v).
+    // motion_vectors(0): upper region (vfs, h, v) then lower (vfs, h, v).
     bw.write_u32(0b0, 1); // upper field-select = 0 (top)
     bw.write_u32(0b1, 1); // upper horiz motion_code = 0
     bw.write_u32(0b1, 1); // upper vert  motion_code = 0
@@ -386,7 +383,7 @@ fn p_field_picture_dual_prime_averages_same_and_opposite_fields() {
     bw.write_u32(0b1, 1); // macroblock_address_increment = 1
     bw.write_u32(0b001, 3); // macroblock_type "MC, Not Coded" (fwd)
     bw.write_u32(0b11, 2); // field_motion_type = Dual prime
-                           // motion_vector(0,0): dmv == 1, no field-select bit.
+    // motion_vector(0,0): dmv == 1, no field-select bit.
     bw.write_u32(0b1, 1); // motion_code horiz = 0
     bw.write_u32(0b0, 1); // dmvector[0] = 0 (Table B-11 `0`)
     bw.write_u32(0b1, 1); // motion_code vert = 0
@@ -427,7 +424,7 @@ fn b_field_picture_skip_inherits_previous_direction_same_parity() {
     bw.write_u32(0b0, 1); // motion_vertical_field_select = 0 (top)
     bw.write_u32(0b1, 1); // fwd motion_code horiz = 0
     bw.write_u32(0b1, 1); // fwd motion_code vert = 0
-                          // MB2 (address 2): address_increment = 2 skips address 1.
+    // MB2 (address 2): address_increment = 2 skips address 1.
     bw.write_u32(0b011, 3); // address_increment = 2 (Table B-1 `011`)
     bw.write_u32(0b010, 3); // forward-only B macroblock
     bw.write_u32(0b01, 2); // Field-based
@@ -454,12 +451,10 @@ fn b_field_picture_skip_inherits_previous_direction_same_parity() {
         }
         f
     };
-    let geom = IntraPictureParams {
+    let geom = (field_geometry_16x16())
         // hand-built stream: progressive grid (Ceil(h/16) macroblock rows)
-        progressive_sequence: true,
-        width: 48,
-        ..field_geometry_16x16()
-    };
+        .with_progressive_sequence(true)
+        .with_width(48);
     let params = PicturePredictionParams {
         geometry: geom,
         picture_coding_type: PictureCodingType::Bidirectional,

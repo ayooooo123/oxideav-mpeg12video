@@ -11,23 +11,13 @@ use oxideav_mpeg12video::picture_spatial_scalable_extension::PictureSpatialScala
 use oxideav_mpeg12video::sequence_extension::{ChromaFormat, Mpeg2Sequence};
 use oxideav_mpeg12video::sequence_scalable_extension::{ScalableMode, SequenceScalableExtension};
 use oxideav_mpeg12video::{
+    DecodedFrame, FrameBuffer, IntraPictureParams, SpatialLayerConfig,
     decode_spatial_scalable_sequence, decode_video_sequence, encode_display_order_gop_sequence,
-    encode_spatial_enhancement_layer, DecodedFrame, FrameBuffer, IntraPictureParams,
-    SpatialLayerConfig,
+    encode_spatial_enhancement_layer,
 };
 
 fn params(width: usize, height: usize, chroma: ChromaFormat) -> IntraPictureParams {
-    IntraPictureParams {
-        width,
-        height,
-        chroma_format: chroma,
-        frame_pred_frame_dct: true,
-        intra_dc_precision: 0,
-        intra_vlc_format: false,
-        alternate_scan: false,
-        q_scale_type: false,
-        progressive_sequence: true,
-    }
+    IntraPictureParams::new(width, height, chroma, true, 0, false, false, false, true)
 }
 
 /// Full-resolution content at instant `t`: a smooth gradient the
@@ -154,10 +144,9 @@ fn build(
 
 #[test]
 fn two_to_one_upsampled_ibp_roundtrips_exactly_and_uses_every_class() {
-    let config = SpatialLayerConfig {
-        quantiser_scale_code: 5,
-        f_code: 3,
-    };
+    let config = SpatialLayerConfig::default()
+        .with_quantiser_scale_code(5)
+        .with_f_code(3);
     let (base, sources, enc) = build(ChromaFormat::Yuv420, ChromaFormat::Yuv420, 5, 6, &config);
     let stats = enc.stats;
     assert!(stats.spatial_only > 0, "{stats:?}");
@@ -226,11 +215,12 @@ fn two_to_one_upsampled_ibp_roundtrips_exactly_and_uses_every_class() {
         .map(|(i, _)| PictureSpatialScalableExtension::parse(&enc.stream[i..]).unwrap())
         .collect();
     assert_eq!(pss.len(), 5);
-    assert!(pss
-        .iter()
-        .all(|p| p.spatial_temporal_weight_code_table_index == 0
-            && p.lower_layer_progressive_frame
-            && p.lower_layer_horizontal_offset == 0));
+    assert!(
+        pss.iter()
+            .all(|p| p.spatial_temporal_weight_code_table_index == 0
+                && p.lower_layer_progressive_frame
+                && p.lower_layer_horizontal_offset == 0)
+    );
     // Coded order I P B P B → lower_layer_temporal_reference 0 2 1 4 3.
     let trefs: Vec<u16> = pss
         .iter()
@@ -311,10 +301,7 @@ fn mismatched_pairs_and_garbage_are_rejected_not_panicked() {
     let (base, sources, enc) = build(ChromaFormat::Yuv420, ChromaFormat::Yuv420, 3, 8, &config);
 
     assert!(encode_spatial_enhancement_layer(&base, &sources[..2], &config).is_err());
-    let bad = SpatialLayerConfig {
-        quantiser_scale_code: 0,
-        ..config
-    };
+    let bad = config.with_quantiser_scale_code(0);
     assert!(encode_spatial_enhancement_layer(&base, &sources, &bad).is_err());
     // A lower layer of a different geometry than the extension declares.
     let other: Vec<FrameBuffer> = sources
@@ -343,11 +330,9 @@ fn mismatched_pairs_and_garbage_are_rejected_not_panicked() {
             .collect::<Vec<_>>(),
         1,
         2,
-        &oxideav_mpeg12video::Mpeg1SequenceParams {
-            horizontal_size: 32,
-            vertical_size: 24,
-            ..Default::default()
-        },
+        &oxideav_mpeg12video::Mpeg1SequenceParams::default()
+            .with_horizontal_size(32)
+            .with_vertical_size(24),
         6,
         3,
         3,

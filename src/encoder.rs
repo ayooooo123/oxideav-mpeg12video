@@ -84,17 +84,17 @@
 use std::collections::VecDeque;
 
 use oxideav_core::{
-    parse_options, CodecId, CodecOptionsStruct, CodecParameters, Encoder, Error, Frame,
-    OptionField, OptionKind, OptionValue, Packet, PixelFormat, Result, TimeBase, VideoFrame,
+    CodecId, CodecOptionsStruct, CodecParameters, Encoder, Error, Frame, OptionField, OptionKind,
+    OptionValue, Packet, PixelFormat, Result, TimeBase, VideoFrame, parse_options,
 };
 
+use crate::Error as Mpeg12Error;
 use crate::encode_options::FrameEncodeOptions;
 use crate::frame_assembly::{FrameBuffer, IntraPictureParams};
 use crate::mpeg1_stream_writer::Mpeg1SequenceParams;
 use crate::quant_matrix_extension::QuantMatrixExtension;
 use crate::rate_control::CbrConfig;
 use crate::sequence_extension::ChromaFormat;
-use crate::Error as Mpeg12Error;
 
 /// Fold a crate-local [`Mpeg12Error`] into the framework
 /// [`oxideav_core::Error`] the [`Encoder`] contract speaks (same
@@ -113,6 +113,7 @@ fn map_err(err: Mpeg12Error) -> Error {
 
 /// `picture_structure` option values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum PictureStructureOption {
     /// Frame pictures with `frame_pred_frame_dct = 1`.
     #[default]
@@ -129,6 +130,7 @@ pub enum PictureStructureOption {
 
 /// `rate_control` option values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum RateControlOption {
     /// One `quantiser_scale_code` for every slice.
     #[default]
@@ -139,6 +141,7 @@ pub enum RateControlOption {
 
 /// `pulldown` option values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum PulldownOption {
     /// Constant `top_field_first` / `repeat_first_field`.
     #[default]
@@ -152,6 +155,7 @@ pub enum PulldownOption {
 /// caller, or let [`make_encoder`] parse it from
 /// [`CodecParameters::options`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Mpeg12EncoderOptions {
     /// `quantiser_scale_code` (`1..=31`).
     pub quantiser_scale_code: u32,
@@ -197,6 +201,162 @@ pub struct Mpeg12EncoderOptions {
     pub data_partitioning: u32,
     /// `mpeg1_d_pictures`.
     pub mpeg1_d_pictures: bool,
+}
+
+impl Mpeg12EncoderOptions {
+    /// Set `quantiser_scale_code`.
+    #[must_use]
+    pub fn with_quantiser_scale_code(mut self, v: u32) -> Self {
+        self.quantiser_scale_code = v;
+        self
+    }
+
+    /// Set `b_between`.
+    #[must_use]
+    pub fn with_b_between(mut self, v: u32) -> Self {
+        self.b_between = v;
+        self
+    }
+
+    /// Set `anchors_per_gop`.
+    #[must_use]
+    pub fn with_anchors_per_gop(mut self, v: u32) -> Self {
+        self.anchors_per_gop = v;
+        self
+    }
+
+    /// Set `f_code`.
+    #[must_use]
+    pub fn with_f_code(mut self, v: u32) -> Self {
+        self.f_code = v;
+        self
+    }
+
+    /// Set `backward_f_code`.
+    #[must_use]
+    pub fn with_backward_f_code(mut self, v: u32) -> Self {
+        self.backward_f_code = v;
+        self
+    }
+
+    /// Set `picture_structure`.
+    #[must_use]
+    pub fn with_picture_structure(mut self, v: PictureStructureOption) -> Self {
+        self.picture_structure = v;
+        self
+    }
+
+    /// Set `interlaced`.
+    #[must_use]
+    pub fn with_interlaced(mut self, v: bool) -> Self {
+        self.interlaced = v;
+        self
+    }
+
+    /// Set `intra_vlc_format`.
+    #[must_use]
+    pub fn with_intra_vlc_format(mut self, v: bool) -> Self {
+        self.intra_vlc_format = v;
+        self
+    }
+
+    /// Set `alternate_scan`.
+    #[must_use]
+    pub fn with_alternate_scan(mut self, v: bool) -> Self {
+        self.alternate_scan = v;
+        self
+    }
+
+    /// Set `q_scale_type`.
+    #[must_use]
+    pub fn with_q_scale_type(mut self, v: bool) -> Self {
+        self.q_scale_type = v;
+        self
+    }
+
+    /// Set `intra_dc_precision`.
+    #[must_use]
+    pub fn with_intra_dc_precision(mut self, v: u32) -> Self {
+        self.intra_dc_precision = v;
+        self
+    }
+
+    /// Set `skipped_macroblocks`.
+    #[must_use]
+    pub fn with_skipped_macroblocks(mut self, v: bool) -> Self {
+        self.skipped_macroblocks = v;
+        self
+    }
+
+    /// Set `concealment_motion_vectors`.
+    #[must_use]
+    pub fn with_concealment_motion_vectors(mut self, v: bool) -> Self {
+        self.concealment_motion_vectors = v;
+        self
+    }
+
+    /// Set `top_field_first`.
+    #[must_use]
+    pub fn with_top_field_first(mut self, v: bool) -> Self {
+        self.top_field_first = v;
+        self
+    }
+
+    /// Set `repeat_first_field`.
+    #[must_use]
+    pub fn with_repeat_first_field(mut self, v: bool) -> Self {
+        self.repeat_first_field = v;
+        self
+    }
+
+    /// Set `pulldown`.
+    #[must_use]
+    pub fn with_pulldown(mut self, v: PulldownOption) -> Self {
+        self.pulldown = v;
+        self
+    }
+
+    /// Set `dual_prime`.
+    #[must_use]
+    pub fn with_dual_prime(mut self, v: bool) -> Self {
+        self.dual_prime = v;
+        self
+    }
+
+    /// Set `rate_control`.
+    #[must_use]
+    pub fn with_rate_control(mut self, v: RateControlOption) -> Self {
+        self.rate_control = v;
+        self
+    }
+
+    /// Set `bit_rate_value`.
+    #[must_use]
+    pub fn with_bit_rate_value(mut self, v: u32) -> Self {
+        self.bit_rate_value = v;
+        self
+    }
+
+    /// Set `vbv_buffer_size_value`.
+    #[must_use]
+    pub fn with_vbv_buffer_size_value(mut self, v: u32) -> Self {
+        self.vbv_buffer_size_value = v;
+        self
+    }
+
+    /// Set `data_partitioning`.
+    #[must_use]
+    pub fn with_data_partitioning(mut self, v: u32) -> Self {
+        self.data_partitioning = v;
+        self
+    }
+
+    /// Set `mpeg1_d_pictures`.
+    #[must_use]
+    pub fn with_mpeg1_d_pictures(mut self, v: bool) -> Self {
+        self.mpeg1_d_pictures = v;
+        self
+    }
 }
 
 impl Default for Mpeg12EncoderOptions {
@@ -384,7 +544,7 @@ impl CodecOptionsStruct for Mpeg12EncoderOptions {
                     other => {
                         return Err(Error::invalid(format!(
                             "mpeg12video encoder: picture_structure '{other}'"
-                        )))
+                        )));
                     }
                 }
             }
@@ -404,7 +564,7 @@ impl CodecOptionsStruct for Mpeg12EncoderOptions {
                     other => {
                         return Err(Error::invalid(format!(
                             "mpeg12video encoder: pulldown '{other}'"
-                        )))
+                        )));
                     }
                 }
             }
@@ -416,7 +576,7 @@ impl CodecOptionsStruct for Mpeg12EncoderOptions {
                     other => {
                         return Err(Error::invalid(format!(
                             "mpeg12video encoder: rate_control '{other}'"
-                        )))
+                        )));
                     }
                 }
             }
@@ -427,7 +587,7 @@ impl CodecOptionsStruct for Mpeg12EncoderOptions {
             other => {
                 return Err(Error::invalid(format!(
                     "mpeg12video encoder: unknown option '{other}'"
-                )))
+                )));
             }
         }
         Ok(())
@@ -521,7 +681,7 @@ impl EncoderConfig {
             Some(other) => {
                 return Err(invalid(format!(
                     "unsupported pixel format {other:?} (planar 4:2:0 / 4:2:2 / 4:4:4)"
-                )))
+                )));
             }
         };
 

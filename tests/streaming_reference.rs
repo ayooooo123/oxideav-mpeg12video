@@ -230,7 +230,7 @@ fn seek_applies_matrix_download_of_a_discarded_leading_picture() {
     let codes: Vec<(usize, u8)> = data.windows(4).enumerate()
         .filter(|(_, w)| w[..3] == [0, 0, 1]).map(|(i, w)| (i, w[3])).collect();
     let next = |from: usize, code: Option<u8>| codes.iter()
-        .find(|&&(i, c)| i > from && code.map_or(true, |code| c == code)).unwrap().0;
+        .find(|&&(i, c)| i > from && code.is_none_or(|code| c == code)).unwrap().0;
     // Enter at the second sequence. Its GOP is open, so the B-pictures
     // coded after its I-picture lack a forward reference and are discarded.
     let seek = codes.iter().filter(|&&(_, c)| c == 0xB3).nth(1).unwrap().0;

@@ -9,10 +9,10 @@ use oxideav_mpeg12video::gop_header::{Mpeg2Gop, TimeCode};
 use oxideav_mpeg12video::sequence_extension::ChromaFormat;
 use oxideav_mpeg12video::sequence_header::Mpeg2SequenceHeader;
 use oxideav_mpeg12video::{
-    decode_video_sequence, display_indices_from_coded_pictures, encode_mpeg1_b_picture,
+    FrameBuffer, Mpeg1PictureParams, Mpeg1SequenceParams, PictureCodingType, decode_video_sequence,
+    display_indices_from_coded_pictures, encode_mpeg1_b_picture,
     encode_mpeg1_display_order_sequence, encode_mpeg1_intra_picture, encode_mpeg1_intra_stream,
-    encode_mpeg1_p_picture, FrameBuffer, Mpeg1PictureParams, Mpeg1SequenceParams,
-    PictureCodingType,
+    encode_mpeg1_p_picture,
 };
 
 /// Deterministic synthetic frame: a diagonal gradient with a chequer
@@ -26,7 +26,11 @@ fn frame_at(width: usize, height: usize, dx: usize, dy: usize, stamp: bool) -> F
             let sx = x + dx;
             let sy = y + dy;
             let g = 24 + ((sx * 3 + sy * 5) % 192);
-            let c = if (sx / 4 + sy / 4) % 2 == 0 { 16 } else { 0 };
+            let c = if (sx / 4 + sy / 4).is_multiple_of(2) {
+                16
+            } else {
+                0
+            };
             f.y.put_sample(x, y, (g + c).min(235) as u8);
         }
     }
@@ -47,20 +51,17 @@ fn frame_at(width: usize, height: usize, dx: usize, dy: usize, stamp: bool) -> F
 }
 
 fn seq(width: u16, height: u16) -> Mpeg1SequenceParams {
-    Mpeg1SequenceParams {
-        horizontal_size: width,
-        vertical_size: height,
-        ..Default::default()
-    }
+    Mpeg1SequenceParams::default()
+        .with_horizontal_size(width)
+        .with_vertical_size(height)
 }
 
 fn params(width: usize, height: usize) -> Mpeg1PictureParams {
-    Mpeg1PictureParams {
-        width,
-        height,
-        intra_quant: oxideav_mpeg12video::DEFAULT_INTRA_QUANT,
-        non_intra_quant: oxideav_mpeg12video::DEFAULT_NON_INTRA_QUANT,
-    }
+    Mpeg1PictureParams::default()
+        .with_width(width)
+        .with_height(height)
+        .with_intra_quant(oxideav_mpeg12video::DEFAULT_INTRA_QUANT)
+        .with_non_intra_quant(oxideav_mpeg12video::DEFAULT_NON_INTRA_QUANT)
 }
 
 /// Assert two frames match sample-for-sample over the visible area.
@@ -349,11 +350,9 @@ fn loaded_quantizer_matrices_thread_through_encode_and_decode() {
         *v = 12 + (i as u8 % 8);
     }
     let non_intra = [20u8; 64];
-    let seq_custom = Mpeg1SequenceParams {
-        intra_quant_matrix: Some(intra),
-        non_intra_quant_matrix: Some(non_intra),
-        ..seq(w as u16, h as u16)
-    };
+    let seq_custom = seq(w as u16, h as u16)
+        .with_intra_quant_matrix(Some(intra))
+        .with_non_intra_quant_matrix(Some(non_intra));
 
     let custom = encode_mpeg1_display_order_sequence(&display, 1, 1, &seq_custom, 6, 3, 3)
         .expect("custom-matrix encode");

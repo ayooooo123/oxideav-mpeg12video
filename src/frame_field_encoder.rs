@@ -73,45 +73,45 @@
 
 use oxideav_core::bits::BitWriter;
 
-use crate::b_picture_encoder::{write_b_macroblock_type, BDirection};
+use crate::b_picture_encoder::{BDirection, write_b_macroblock_type};
 use crate::coded_block_pattern::encode_coded_block_pattern;
-use crate::dual_prime::{derive_all, DualPrimePicture, FieldParity};
+use crate::dual_prime::{DualPrimePicture, FieldParity, derive_all};
 use crate::field_picture_encoder::FieldSearchResult;
-use crate::forming_predictions::{predict_field_block, BlockSize, FieldReference, ReferencePlane};
+use crate::forming_predictions::{BlockSize, FieldReference, ReferencePlane, predict_field_block};
 use crate::forward_dct::fdct_8x8;
 use crate::forward_quant::forward_quantise_block;
-use crate::frame_assembly::{block_placement, place_intra_block, FrameBuffer, IntraPictureParams};
-use crate::gop_header::{write_gop_header, Mpeg2Gop, TimeCode};
+use crate::frame_assembly::{FrameBuffer, IntraPictureParams, block_placement, place_intra_block};
+use crate::gop_header::{Mpeg2Gop, TimeCode, write_gop_header};
 use crate::idct::idct_8x8_from_i32;
 use crate::inter_reconstruction::{
-    chroma_mb_extent, predict_field_based_macroblock_planes,
+    FieldBasedMotion, FieldVector, FrameDualPrimeMotion, FrameMotion, MotionVectorPel,
+    ReferenceFrames, ResidualBlock, chroma_mb_extent, predict_field_based_macroblock_planes,
     predict_frame_dual_prime_macroblock_planes, predict_frame_macroblock_planes,
     reconstruct_field_based_macroblock, reconstruct_frame_dual_prime_macroblock,
-    reconstruct_inter_macroblock, FieldBasedMotion, FieldVector, FrameDualPrimeMotion, FrameMotion,
-    MotionVectorPel, ReferenceFrames, ResidualBlock,
+    reconstruct_inter_macroblock,
 };
 use crate::motion_estimation::{estimate_forward_mv, max_search_range};
 use crate::motion_vector::{encode_dmvector, encode_motion_component};
-use crate::mpeg2_block_dc::{encode_intra_dc, ColourComponent, DcComponent};
+use crate::mpeg2_block_dc::{ColourComponent, DcComponent, encode_intra_dc};
 use crate::mpeg2_dct_coeff::{
-    encode_dct_coeff, encode_end_of_block, CoefficientPosition, TableSelection,
+    CoefficientPosition, TableSelection, encode_dct_coeff, encode_end_of_block,
 };
 use crate::mpeg2_dequantize::{
-    intra_dc_mult, inverse_quantise_block, quantiser_scale, BlockCoding, DEFAULT_INTRA_WEIGHT,
-    DEFAULT_NON_INTRA_WEIGHT,
+    BlockCoding, DEFAULT_INTRA_WEIGHT, DEFAULT_NON_INTRA_WEIGHT, intra_dc_mult,
+    inverse_quantise_block, quantiser_scale,
 };
 use crate::mpeg2_inverse_scan::inverse_scan_table;
 use crate::mpeg2_macroblock_blocks::{block_component, block_count};
 use crate::p_picture_encoder::{
-    intra_activity, nonintra_block_has_cbp_slot, quantise_inter_block, wrap_delta,
-    write_inter_block_coeffs, InterBlock, IntraDcPred,
+    InterBlock, IntraDcPred, intra_activity, nonintra_block_has_cbp_slot, quantise_inter_block,
+    wrap_delta, write_inter_block_coeffs,
 };
 use crate::picture_header::PictureCodingType;
 use crate::sequence_extension::ChromaFormat;
 use crate::stream_writer::{
+    PictureCodingExtensionParams, SEQUENCE_END_CODE, SequenceHeaderParams,
     write_picture_coding_extension, write_picture_header, write_sequence_extension,
-    write_sequence_header, write_slice_header_in, PictureCodingExtensionParams,
-    SequenceHeaderParams, SEQUENCE_END_CODE,
+    write_sequence_header, write_slice_header_in,
 };
 use crate::{Error, Result};
 
@@ -136,6 +136,7 @@ const DUAL_PRIME_BIAS: u32 = 32;
 /// callers and tests can confirm the per-macroblock adaptive decisions
 /// (frame/field prediction, dual-prime, field DCT) actually fire.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FrameFieldStats {
     /// Macroblocks coded with Table 6-17 `Frame-based` prediction.
     pub frame_mc: usize,
@@ -148,6 +149,43 @@ pub struct FrameFieldStats {
     pub intra: usize,
     /// Macroblocks whose transmitted `dct_type` selected **field DCT**.
     pub field_dct: usize,
+}
+
+impl FrameFieldStats {
+    /// Set `frame_mc`.
+    #[must_use]
+    pub fn with_frame_mc(mut self, v: usize) -> Self {
+        self.frame_mc = v;
+        self
+    }
+
+    /// Set `field_mc`.
+    #[must_use]
+    pub fn with_field_mc(mut self, v: usize) -> Self {
+        self.field_mc = v;
+        self
+    }
+
+    /// Set `dual_prime`.
+    #[must_use]
+    pub fn with_dual_prime(mut self, v: usize) -> Self {
+        self.dual_prime = v;
+        self
+    }
+
+    /// Set `intra`.
+    #[must_use]
+    pub fn with_intra(mut self, v: usize) -> Self {
+        self.intra = v;
+        self
+    }
+
+    /// Set `field_dct`.
+    #[must_use]
+    pub fn with_field_dct(mut self, v: usize) -> Self {
+        self.field_dct = v;
+        self
+    }
 }
 
 impl FrameFieldStats {
@@ -351,15 +389,15 @@ pub fn estimate_field_in_frame_mv(
                 consider(int_hx + ox, int_hy + oy, &mut p_best, current);
             }
         }
-        if let Some((hx, hy, sad, score)) = p_best {
-            if score < best_score {
-                best_score = score;
-                best = Some(FieldSearchResult {
-                    vector: MotionVectorPel::new(hx, hy),
-                    parity,
-                    sad,
-                });
-            }
+        if let Some((hx, hy, sad, score)) = p_best
+            && score < best_score
+        {
+            best_score = score;
+            best = Some(FieldSearchResult {
+                vector: MotionVectorPel::new(hx, hy),
+                parity,
+                sad,
+            });
         }
     }
     // The zero vector into the same-parity field is always legal for
@@ -1166,11 +1204,11 @@ pub fn encode_ff_p_picture(
                         }
                     }
                 }
-                if let Some((sad, dmv, motion)) = dp_best {
-                    if sad.saturating_add(DUAL_PRIME_BIAS) < best_score {
-                        best_mode = PMode::DualPrime(base_mv, dmv, motion);
-                        best_sad = sad;
-                    }
+                if let Some((sad, dmv, motion)) = dp_best
+                    && sad.saturating_add(DUAL_PRIME_BIAS) < best_score
+                {
+                    best_mode = PMode::DualPrime(base_mv, dmv, motion);
+                    best_sad = sad;
                 }
             }
 

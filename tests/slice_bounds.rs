@@ -35,18 +35,21 @@ fn track(delta: isize) {
 // SAFETY: every call forwards to `System` unchanged; only counters are added.
 unsafe impl GlobalAlloc for Tracking {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc(layout);
+        // SAFETY: forwarded unchanged under the caller's contract.
+        let p = unsafe { System.alloc(layout) };
         if !p.is_null() {
             track(layout.size() as isize);
         }
         p
     }
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
-        System.dealloc(p, layout);
+        // SAFETY: forwarded unchanged under the caller's contract.
+        unsafe { System.dealloc(p, layout) };
         track(-(layout.size() as isize));
     }
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        let q = System.realloc(p, layout, size);
+        // SAFETY: forwarded unchanged under the caller's contract.
+        let q = unsafe { System.realloc(p, layout, size) };
         if !q.is_null() {
             track(size as isize - layout.size() as isize);
         }
@@ -89,7 +92,7 @@ fn dc_only_intra_macroblock(bw: &mut BitWriter) {
 fn intra_picture_16x16(mpeg1: bool, slices: &[usize]) -> Vec<u8> {
     let mut bw = BitWriter::new();
     if mpeg1 {
-        let seq = Mpeg1SequenceParams { horizontal_size: 16, vertical_size: 16, ..Default::default() };
+        let seq = Mpeg1SequenceParams::default().with_horizontal_size(16).with_vertical_size(16);
         write_mpeg1_sequence_header(&mut bw, &seq).unwrap();
     } else {
         let seq = SequenceHeaderParams { horizontal_size: 16, vertical_size: 16, ..Default::default() };

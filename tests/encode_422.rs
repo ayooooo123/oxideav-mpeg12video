@@ -17,22 +17,22 @@
 
 use oxideav_mpeg12video::sequence_extension::ChromaFormat;
 use oxideav_mpeg12video::{
-    decode_video_sequence, encode_display_order_gop_sequence, encode_i_p_b, encode_i_then_p,
-    encode_intra_picture, encode_p_picture, FrameBuffer, IntraPictureParams,
+    FrameBuffer, IntraPictureParams, decode_video_sequence, encode_display_order_gop_sequence,
+    encode_i_p_b, encode_i_then_p, encode_intra_picture, encode_p_picture,
 };
 
 fn params_422(width: usize, height: usize) -> IntraPictureParams {
-    IntraPictureParams {
-        progressive_sequence: true,
+    IntraPictureParams::new(
         width,
         height,
-        chroma_format: ChromaFormat::Yuv422,
-        frame_pred_frame_dct: true,
-        intra_dc_precision: 0,
-        intra_vlc_format: false,
-        alternate_scan: false,
-        q_scale_type: false,
-    }
+        ChromaFormat::Yuv422,
+        true,
+        0,
+        false,
+        false,
+        false,
+        true,
+    )
 }
 
 /// Deterministic 4:2:2 content: diagonal luma gradient + checker, and
@@ -44,7 +44,11 @@ fn frame_422(width: usize, height: usize, shift: usize) -> FrameBuffer {
         for x in 0..width {
             let sx = x + shift;
             let g = 24 + ((sx * 3 + y * 5) % 192);
-            let c = if (sx / 4 + y / 4) % 2 == 0 { 12 } else { 0 };
+            let c = if (sx / 4 + y / 4).is_multiple_of(2) {
+                12
+            } else {
+                0
+            };
             f.y.put_sample(x, y, (g + c).min(235) as u8);
         }
     }
@@ -306,13 +310,11 @@ fn gop_422_display_order_sequence_roundtrips() {
 /// Table 7-6 non-linear quantiser scale (`q_scale_type`), 10-bit intra
 /// DC (`intra_dc_precision = 2`), and the §7.3 alternate scan.
 fn params_422_full_flags(width: usize, height: usize) -> IntraPictureParams {
-    IntraPictureParams {
-        intra_dc_precision: 2,
-        intra_vlc_format: true,
-        alternate_scan: true,
-        q_scale_type: true,
-        ..params_422(width, height)
-    }
+    params_422(width, height)
+        .with_intra_dc_precision(2)
+        .with_intra_vlc_format(true)
+        .with_alternate_scan(true)
+        .with_q_scale_type(true)
 }
 
 #[test]
@@ -402,10 +404,7 @@ fn intra_422_ten_bit_dc_beats_eight_bit_dc_on_smooth_ramps() {
         }
     }
     let p8 = params_422(64, 48);
-    let p10 = IntraPictureParams {
-        intra_dc_precision: 2,
-        ..p8
-    };
+    let p10 = p8.with_intra_dc_precision(2);
     let mae8 = {
         let s = encode_intra_picture(&f, p8, 0, 2).expect("encode p8");
         let d = decode_video_sequence(&s).expect("decode p8");
@@ -474,16 +473,15 @@ fn cbr_422_gop_sequence_is_vbv_conformant_and_decodes() {
     // encoders at 4:2:2: the emitted stream must satisfy its declared
     // bit_rate / vbv_buffer_size under the whole-stream verifier and
     // decode faithfully.
-    use oxideav_mpeg12video::vbv::{verify_cbr_stream, VbvStandard};
     use oxideav_mpeg12video::CbrConfig;
+    use oxideav_mpeg12video::vbv::{VbvStandard, verify_cbr_stream};
 
     let frames_in: Vec<FrameBuffer> = (0..5).map(|k| frame_422(64, 48, 2 * k)).collect();
-    let cbr = CbrConfig {
-        bit_rate_value: 800, // 320 kbit/s (4:2:2 carries more chroma)
-        vbv_buffer_size_value: 4,
-        frame_rate_code: 3,
-        initial_quantiser_scale_code: 6,
-    };
+    let cbr = CbrConfig::default()
+        .with_bit_rate_value(800) // 320 kbit/s (4:2:2 carries more chroma)
+        .with_vbv_buffer_size_value(4)
+        .with_frame_rate_code(3)
+        .with_initial_quantiser_scale_code(6);
     let encoded = oxideav_mpeg12video::encode_cbr_gop_sequence(
         &frames_in,
         1,

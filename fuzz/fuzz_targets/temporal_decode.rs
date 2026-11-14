@@ -11,8 +11,8 @@ use std::sync::OnceLock;
 use libfuzzer_sys::fuzz_target;
 use oxideav_mpeg12video::sequence_extension::ChromaFormat;
 use oxideav_mpeg12video::{
-    decode_temporal_scalable_sequence, encode_display_order_gop_sequence,
-    encode_temporal_enhancement_layer, FrameBuffer, IntraPictureParams, TemporalLayerConfig,
+    FrameBuffer, IntraPictureParams, TemporalLayerConfig, decode_temporal_scalable_sequence,
+    encode_display_order_gop_sequence, encode_temporal_enhancement_layer,
 };
 
 fn frame_at(t: usize) -> FrameBuffer {
@@ -37,17 +37,17 @@ fn layers() -> &'static (Vec<u8>, Vec<u8>) {
     static LAYERS: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
     LAYERS.get_or_init(|| {
         let lower: Vec<FrameBuffer> = (0..3).map(|j| frame_at(2 * j)).collect();
-        let params = IntraPictureParams {
-            width: 48,
-            height: 32,
-            chroma_format: ChromaFormat::Yuv420,
-            frame_pred_frame_dct: true,
-            intra_dc_precision: 0,
-            intra_vlc_format: false,
-            alternate_scan: false,
-            q_scale_type: false,
-            progressive_sequence: true,
-        };
+        let params = IntraPictureParams::new(
+            48,
+            32,
+            ChromaFormat::Yuv420,
+            true,
+            0,
+            false,
+            false,
+            false,
+            true,
+        );
         let base =
             encode_display_order_gop_sequence(&lower, 1, 2, params, 8, 3, 3).expect("lower layer");
         let sources: Vec<FrameBuffer> = (0..2).map(|j| frame_at(2 * j + 1)).collect();

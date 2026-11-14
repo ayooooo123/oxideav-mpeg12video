@@ -10,23 +10,23 @@ use oxideav_mpeg12video::picture_temporal_scalable_extension::PictureTemporalSca
 use oxideav_mpeg12video::sequence_extension::{ChromaFormat, Mpeg2Sequence};
 use oxideav_mpeg12video::sequence_scalable_extension::{ScalableMode, SequenceScalableExtension};
 use oxideav_mpeg12video::{
+    DecodedFrame, FrameBuffer, IntraPictureParams, PictureCodingType, TemporalLayerConfig,
     decode_temporal_scalable_sequence, decode_video_sequence, encode_display_order_gop_sequence,
-    encode_temporal_enhancement_layer, DecodedFrame, FrameBuffer, IntraPictureParams,
-    PictureCodingType, TemporalLayerConfig,
+    encode_temporal_enhancement_layer,
 };
 
 fn params(width: usize, height: usize, progressive: bool) -> IntraPictureParams {
-    IntraPictureParams {
+    IntraPictureParams::new(
         width,
         height,
-        chroma_format: ChromaFormat::Yuv420,
-        frame_pred_frame_dct: true,
-        intra_dc_precision: 0,
-        intra_vlc_format: false,
-        alternate_scan: false,
-        q_scale_type: false,
-        progressive_sequence: progressive,
-    }
+        ChromaFormat::Yuv420,
+        true,
+        0,
+        false,
+        false,
+        false,
+        progressive,
+    )
 }
 
 /// Content at "time" `t2` in half-frame units: the lower layer takes
@@ -37,7 +37,11 @@ fn frame_at_half(width: usize, height: usize, t2: usize) -> FrameBuffer {
         for x in 0..width {
             let sx = x + t2;
             let g = 24 + ((sx * 3 + y * 5) % 192);
-            let c = if (sx / 4 + y / 4) % 2 == 0 { 16 } else { 0 };
+            let c = if (sx / 4 + y / 4).is_multiple_of(2) {
+                16
+            } else {
+                0
+            };
             f.y.put_sample(x, y, (g + c).min(235) as u8);
         }
     }
@@ -128,13 +132,12 @@ fn build(
 
 #[test]
 fn doubling_the_frame_rate_roundtrips_exactly_and_remultiplexes() {
-    let config = TemporalLayerConfig {
-        quantiser_scale_code: 6,
-        f_code: 3,
-        picture_mux_order: 0,
-        picture_mux_factor: 1,
-        use_enhancement_references: false,
-    };
+    let config = TemporalLayerConfig::default()
+        .with_quantiser_scale_code(6)
+        .with_f_code(3)
+        .with_picture_mux_order(0)
+        .with_picture_mux_factor(1)
+        .with_use_enhancement_references(false);
     let (base, sources, enc) = build(5, true, config);
     assert_eq!(enc.enhancement.len(), 4);
     assert_eq!(
@@ -150,10 +153,12 @@ fn doubling_the_frame_rate_roundtrips_exactly_and_remultiplexes() {
         &decoded.lower,
         &decode_video_sequence(&base).unwrap(),
     );
-    assert!(decoded
-        .enhancement
-        .iter()
-        .all(|d| d.picture_coding_type == PictureCodingType::Bidirectional));
+    assert!(
+        decoded
+            .enhancement
+            .iter()
+            .all(|d| d.picture_coding_type == PictureCodingType::Bidirectional)
+    );
 
     // The remultiplex interleaves L E L E L E L E L (identity, not
     // coding type: the lower layer is itself I B P B P).
@@ -203,13 +208,12 @@ fn doubling_the_frame_rate_roundtrips_exactly_and_remultiplexes() {
 fn leading_pictures_and_enhancement_references_cover_the_reference_codes() {
     // order = 2 (two P pictures from the *next* lower frame, code 10),
     // factor = 3 with enhancement references: B 11 then B 10, B 10.
-    let config = TemporalLayerConfig {
-        quantiser_scale_code: 5,
-        f_code: 3,
-        picture_mux_order: 2,
-        picture_mux_factor: 3,
-        use_enhancement_references: true,
-    };
+    let config = TemporalLayerConfig::default()
+        .with_quantiser_scale_code(5)
+        .with_f_code(3)
+        .with_picture_mux_order(2)
+        .with_picture_mux_factor(3)
+        .with_use_enhancement_references(true);
     let (base, _sources, enc) = build(3, true, config);
     assert_eq!(enc.enhancement.len(), 2 + 3 * 2);
     assert_eq!(
@@ -260,10 +264,7 @@ fn mismatched_pairs_and_garbage_are_rejected_not_panicked() {
 
     // Wrong source count / geometry / configuration.
     assert!(encode_temporal_enhancement_layer(&base, &sources[..1], &config).is_err());
-    let bad_cfg = TemporalLayerConfig {
-        picture_mux_factor: 0,
-        ..config
-    };
+    let bad_cfg = config.with_picture_mux_factor(0);
     assert!(encode_temporal_enhancement_layer(&base, &sources, &bad_cfg).is_err());
     let m1 = oxideav_mpeg12video::encode_mpeg1_display_order_sequence(
         &sources
@@ -274,11 +275,9 @@ fn mismatched_pairs_and_garbage_are_rejected_not_panicked() {
             .collect::<Vec<_>>(),
         1,
         2,
-        &oxideav_mpeg12video::Mpeg1SequenceParams {
-            horizontal_size: 64,
-            vertical_size: 48,
-            ..Default::default()
-        },
+        &oxideav_mpeg12video::Mpeg1SequenceParams::default()
+            .with_horizontal_size(64)
+            .with_vertical_size(48),
         6,
         3,
         3,

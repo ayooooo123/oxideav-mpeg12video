@@ -21,10 +21,9 @@ use oxideav_mpeg12video::mpeg2_inverse_scan::inverse_scan_table;
 use oxideav_mpeg12video::quant_matrix_extension::{QuantMatrixExtension, QuantiserMatrixPayload};
 use oxideav_mpeg12video::sequence_extension::ChromaFormat;
 use oxideav_mpeg12video::{
-    decode_video_sequence, encode_display_order_gop_sequence,
+    FrameBuffer, IntraPictureParams, decode_video_sequence, encode_display_order_gop_sequence,
     encode_display_order_gop_sequence_with_matrices, encode_intra_picture,
-    encode_intra_picture_with_matrices, encode_p_picture_with_matrices, FrameBuffer,
-    IntraPictureParams,
+    encode_intra_picture_with_matrices, encode_p_picture_with_matrices,
 };
 
 /// Zigzag-serialise a row-major `W[v][u]` matrix into the §6.3.11
@@ -47,17 +46,7 @@ fn coarse_intra_payload(weight: u8) -> QuantiserMatrixPayload {
 }
 
 fn params(width: usize, height: usize, chroma: ChromaFormat) -> IntraPictureParams {
-    IntraPictureParams {
-        progressive_sequence: true,
-        width,
-        height,
-        chroma_format: chroma,
-        frame_pred_frame_dct: true,
-        intra_dc_precision: 0,
-        intra_vlc_format: false,
-        alternate_scan: false,
-        q_scale_type: false,
-    }
+    IntraPictureParams::new(width, height, chroma, true, 0, false, false, false, true)
 }
 
 fn busy_frame(width: usize, height: usize, chroma: ChromaFormat, shift: usize) -> FrameBuffer {
@@ -66,7 +55,11 @@ fn busy_frame(width: usize, height: usize, chroma: ChromaFormat, shift: usize) -
         for x in 0..width {
             let sx = x + shift;
             let g = 24 + ((sx * 3 + y * 5) % 192);
-            let c = if (sx / 4 + y / 4) % 2 == 0 { 12 } else { 0 };
+            let c = if (sx / 4 + y / 4).is_multiple_of(2) {
+                12
+            } else {
+                0
+            };
             f.y.put_sample(x, y, (g + c).min(235) as u8);
         }
     }

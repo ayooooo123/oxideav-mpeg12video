@@ -1,8 +1,8 @@
 [package]
 name = "oxideav-mpeg12video"
-version = "0.0.13"
-edition = "2021"
-rust-version = "1.80"
+version = "0.0.14"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT AND LGPL-2.1-or-later"
 repository = "https://github.com/OxideAV/oxideav-mpeg12video"
 authors = ["Mark Karpeles"]

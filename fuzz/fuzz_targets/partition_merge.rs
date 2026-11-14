@@ -9,25 +9,25 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_mpeg12video::sequence_extension::ChromaFormat;
 use oxideav_mpeg12video::{
-    encode_display_order_gop_sequence, merge_data_partitions, split_data_partitions, FrameBuffer,
-    IntraPictureParams,
+    FrameBuffer, IntraPictureParams, encode_display_order_gop_sequence, merge_data_partitions,
+    split_data_partitions,
 };
 use std::sync::OnceLock;
 
 fn partitions() -> &'static Vec<(Vec<u8>, Vec<u8>)> {
     static P: OnceLock<Vec<(Vec<u8>, Vec<u8>)>> = OnceLock::new();
     P.get_or_init(|| {
-        let params = IntraPictureParams {
-            width: 48,
-            height: 32,
-            chroma_format: ChromaFormat::Yuv420,
-            frame_pred_frame_dct: true,
-            intra_dc_precision: 0,
-            intra_vlc_format: false,
-            alternate_scan: false,
-            q_scale_type: false,
-            progressive_sequence: true,
-        };
+        let params = IntraPictureParams::new(
+            48,
+            32,
+            ChromaFormat::Yuv420,
+            true,
+            0,
+            false,
+            false,
+            false,
+            true,
+        );
         let frames: Vec<FrameBuffer> = (0..3)
             .map(|t| {
                 let mut f = FrameBuffer::new(48, 32, ChromaFormat::Yuv420);
@@ -67,7 +67,11 @@ fuzz_target!(|data: &[u8]| {
     // 2. A valid pair with one partition corrupted by the attacker.
     let pairs = partitions();
     let (p0, p1) = &pairs[usize::from(data[0]) % pairs.len()];
-    let mut corrupt = if data[0] & 1 == 0 { p0.clone() } else { p1.clone() };
+    let mut corrupt = if data[0] & 1 == 0 {
+        p0.clone()
+    } else {
+        p1.clone()
+    };
     let len = corrupt.len();
     for (i, &b) in data.iter().enumerate().skip(1) {
         if let Some(slot) = corrupt.get_mut((i * 7 + usize::from(b)) % len) {

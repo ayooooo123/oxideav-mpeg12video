@@ -9,9 +9,9 @@
 use oxideav_mpeg12video::sequence_extension::ChromaFormat;
 use oxideav_mpeg12video::slice_header::{SliceContext, SliceHeader};
 use oxideav_mpeg12video::{
-    decode_data_partitioned, decode_video_sequence, encode_display_order_gop_sequence,
-    encode_field_display_order_gop_sequence, merge_data_partitions, split_data_partitions,
-    FrameBuffer, IntraPictureParams,
+    FrameBuffer, IntraPictureParams, decode_data_partitioned, decode_video_sequence,
+    encode_display_order_gop_sequence, encode_field_display_order_gop_sequence,
+    merge_data_partitions, split_data_partitions,
 };
 
 const W: usize = 16;
@@ -36,17 +36,17 @@ fn frame_at(t: usize) -> FrameBuffer {
 }
 
 fn params(progressive: bool) -> IntraPictureParams {
-    IntraPictureParams {
-        width: W,
-        height: H,
-        chroma_format: ChromaFormat::Yuv420,
-        frame_pred_frame_dct: progressive,
-        intra_dc_precision: 0,
-        intra_vlc_format: false,
-        alternate_scan: false,
-        q_scale_type: false,
-        progressive_sequence: progressive,
-    }
+    IntraPictureParams::new(
+        W,
+        H,
+        ChromaFormat::Yuv420,
+        progressive,
+        0,
+        false,
+        false,
+        false,
+        progressive,
+    )
 }
 
 /// Every slice start code position in `stream`.

@@ -13,9 +13,9 @@
 //! D-pictures), B.5a / B.5b (dct_dc_size).
 
 use oxideav_core::bits::BitWriter;
-use oxideav_mpeg12video::mpeg1_picture::{decode_mpeg1_d_picture, Mpeg1PictureParams};
+use oxideav_mpeg12video::mpeg1_picture::{Mpeg1PictureParams, decode_mpeg1_d_picture};
 use oxideav_mpeg12video::picture_header::PictureCodingType;
-use oxideav_mpeg12video::{decode_video_sequence, DEFAULT_INTRA_QUANT};
+use oxideav_mpeg12video::{DEFAULT_INTRA_QUANT, decode_video_sequence};
 
 /// Write an ISO/IEC 11172-2 §2.4.2.3 sequence header (no extension
 /// follows — that absence is what classifies the stream as MPEG-1).
@@ -64,8 +64,8 @@ fn write_luma_dc(bw: &mut BitWriter, differential: i32) {
         }
         -7 => {
             bw.write_u32(0b101, 3); // size 3
-                                    // §2.4.3.7 negative rule: dct_zz[0] = ((-1) << size) |
-                                    // (differential + 1) → bits '000' decode to -7.
+            // §2.4.3.7 negative rule: dct_zz[0] = ((-1) << size) |
+            // (differential + 1) → bits '000' decode to -7.
             bw.write_u32(0b000, 3);
         }
         other => panic!("unsupported test differential {other}"),
@@ -130,12 +130,11 @@ fn d_picture_driver_reconstructs_flat_planes() {
     write_d_picture(&mut bw, 0, 7);
     let picture = bw.into_bytes();
 
-    let params = Mpeg1PictureParams {
-        width: 32,
-        height: 16,
-        intra_quant: DEFAULT_INTRA_QUANT,
-        non_intra_quant: [[16u8; 8]; 8],
-    };
+    let params = Mpeg1PictureParams::default()
+        .with_width(32)
+        .with_height(16)
+        .with_intra_quant(DEFAULT_INTRA_QUANT)
+        .with_non_intra_quant([[16u8; 8]; 8]);
     let (frame, placed) = decode_mpeg1_d_picture(&picture, &params).expect("D-picture decodes");
     assert_eq!(placed, 2, "two macroblocks decoded");
 
@@ -244,12 +243,11 @@ fn d_macroblock_type_zero_bit_is_rejected() {
     bw.align_to_byte();
     let picture = bw.into_bytes();
 
-    let params = Mpeg1PictureParams {
-        width: 16,
-        height: 16,
-        intra_quant: DEFAULT_INTRA_QUANT,
-        non_intra_quant: [[16u8; 8]; 8],
-    };
+    let params = Mpeg1PictureParams::default()
+        .with_width(16)
+        .with_height(16)
+        .with_intra_quant(DEFAULT_INTRA_QUANT)
+        .with_non_intra_quant([[16u8; 8]; 8]);
     let err = decode_mpeg1_d_picture(&picture, &params).unwrap_err();
     assert!(err.to_string().contains("B.2d"), "unexpected error: {err}");
 }
@@ -272,12 +270,11 @@ fn d_end_of_macroblock_zero_is_rejected() {
     bw.align_to_byte();
     let picture = bw.into_bytes();
 
-    let params = Mpeg1PictureParams {
-        width: 16,
-        height: 16,
-        intra_quant: DEFAULT_INTRA_QUANT,
-        non_intra_quant: [[16u8; 8]; 8],
-    };
+    let params = Mpeg1PictureParams::default()
+        .with_width(16)
+        .with_height(16)
+        .with_intra_quant(DEFAULT_INTRA_QUANT)
+        .with_non_intra_quant([[16u8; 8]; 8]);
     let err = decode_mpeg1_d_picture(&picture, &params).unwrap_err();
     assert!(
         err.to_string().contains("end_of_macroblock"),
@@ -299,12 +296,11 @@ fn skipped_macroblock_in_d_picture_is_rejected() {
     bw.align_to_byte();
     let picture = bw.into_bytes();
 
-    let params = Mpeg1PictureParams {
-        width: 48,
-        height: 16,
-        intra_quant: DEFAULT_INTRA_QUANT,
-        non_intra_quant: [[16u8; 8]; 8],
-    };
+    let params = Mpeg1PictureParams::default()
+        .with_width(48)
+        .with_height(16)
+        .with_intra_quant(DEFAULT_INTRA_QUANT)
+        .with_non_intra_quant([[16u8; 8]; 8]);
     let err = decode_mpeg1_d_picture(&picture, &params).unwrap_err();
     assert!(
         err.to_string().contains("2.4.4.4"),

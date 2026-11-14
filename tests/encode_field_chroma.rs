@@ -10,12 +10,12 @@ use oxideav_core::bits::BitWriter;
 use oxideav_mpeg12video::picture_header::PictureStructure;
 use oxideav_mpeg12video::picture_reconstruction::PicturePredictionParams;
 use oxideav_mpeg12video::sequence_extension::{ChromaFormat, Mpeg2Sequence};
-use oxideav_mpeg12video::vbv::{verify_cbr_stream, VbvStandard};
+use oxideav_mpeg12video::vbv::{VbvStandard, verify_cbr_stream};
 use oxideav_mpeg12video::{
-    decode_field_picture, decode_video_sequence, encode_field_adaptive_display_order_gop_sequence,
+    CbrConfig, FrameBuffer, IntraPictureParams, PictureCodingType, decode_field_picture,
+    decode_video_sequence, encode_field_adaptive_display_order_gop_sequence,
     encode_field_b_picture, encode_field_cbr_gop_sequence, encode_field_display_order_gop_sequence,
-    encode_field_intra_picture, encode_field_p_picture, CbrConfig, FrameBuffer, IntraPictureParams,
-    PictureCodingType,
+    encode_field_intra_picture, encode_field_p_picture,
 };
 
 use oxideav_mpeg12video::inter_reconstruction::ReferenceFrames;
@@ -24,26 +24,14 @@ const W: usize = 48;
 const H: usize = 64; // frame height (multiple of 32); fields are 48x32
 
 fn frame_params(chroma: ChromaFormat) -> IntraPictureParams {
-    IntraPictureParams {
-        width: W,
-        height: H,
-        chroma_format: chroma,
-        frame_pred_frame_dct: false,
-        intra_dc_precision: 0,
-        intra_vlc_format: false,
-        alternate_scan: false,
-        q_scale_type: false,
-        progressive_sequence: false,
-    }
+    IntraPictureParams::new(W, H, chroma, false, 0, false, false, false, false)
 }
 
 fn field_params(chroma: ChromaFormat) -> IntraPictureParams {
-    IntraPictureParams {
-        height: H / 2,
-        frame_pred_frame_dct: false,
-        progressive_sequence: true, // 16-aligned grid in field coordinates
-        ..frame_params(chroma)
-    }
+    frame_params(chroma)
+        .with_height(H / 2)
+        .with_frame_pred_frame_dct(false)
+        .with_progressive_sequence(true) // 16-aligned grid in field coordinates
 }
 
 /// Interlaced-looking source frame at full chroma resolution for the
@@ -374,12 +362,11 @@ fn adaptive_field_sequence_422_covers_every_table_6_18_mode_slot() {
 fn field_cbr_422_holds_the_annex_c_bounds() {
     let chroma = ChromaFormat::Yuv422;
     let frames: Vec<FrameBuffer> = (0..4).map(|t| frame_at(chroma, t)).collect();
-    let cbr = CbrConfig {
-        bit_rate_value: 600, // 240 kbit/s
-        vbv_buffer_size_value: 4,
-        frame_rate_code: 3,
-        initial_quantiser_scale_code: 6,
-    };
+    let cbr = CbrConfig::default()
+        .with_bit_rate_value(600) // 240 kbit/s
+        .with_vbv_buffer_size_value(4)
+        .with_frame_rate_code(3)
+        .with_initial_quantiser_scale_code(6);
     let enc = encode_field_cbr_gop_sequence(&frames, 1, 2, &frame_params(chroma), &cbr, 3, 3)
         .expect("field CBR encode at 4:2:2");
     let report = verify_cbr_stream(&enc.stream, VbvStandard::Mpeg2).expect("VBV conformant");
@@ -399,10 +386,7 @@ fn field_encoders_reject_frame_dct_flag_but_not_chroma_format() {
         &frame_at(ChromaFormat::Yuv422, 0),
         PictureStructure::TopField,
     );
-    let bad = IntraPictureParams {
-        frame_pred_frame_dct: true,
-        ..field_params(ChromaFormat::Yuv422)
-    };
+    let bad = field_params(ChromaFormat::Yuv422).with_frame_pred_frame_dct(true);
     let mut bw = BitWriter::new();
     assert!(
         encode_field_intra_picture(&mut bw, &src, &bad, PictureStructure::TopField, 0, 6).is_err(),
